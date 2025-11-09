@@ -249,6 +249,11 @@ target_link_libraries(RunFull ${LIRPA_LIB})
 target_include_directories(RunFull PRIVATE ${LIBS_INCLUDES})
 target_compile_options(RunFull PRIVATE ${RELEASE_FLAGS})
 
+add_executable(TestFlatten TestFlatten.cpp)
+target_link_libraries(TestFlatten ${LIRPA_LIB})
+target_include_directories(TestFlatten PRIVATE ${LIBS_INCLUDES})
+target_compile_options(TestFlatten PRIVATE ${RELEASE_FLAGS})
+
 # Copy executables to bin directory
 add_custom_command(TARGET RunCROWN POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory ${BIN_DIR}

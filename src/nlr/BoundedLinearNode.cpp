@@ -59,11 +59,14 @@ torch::Tensor BoundedLinearNode::forward(const torch::Tensor& input) {
     }
     
     // Convert input and weight to float32 for consistency
-    torch::Tensor inputFloat = input.to(torch::kFloat32);
-    torch::Tensor weight = _linearModule->weight.to(torch::kFloat32);
-    
+    // Ensure contiguous memory layout for numerical consistency
+    torch::Tensor inputFloat = input.to(torch::kFloat32).contiguous();
+    torch::Tensor weight = _linearModule->weight.to(torch::kFloat32).contiguous();
+
     // Apply linear transformation: y = alpha * (W * x + b)
-    torch::Tensor matmul_result = torch::matmul(inputFloat, weight.t());
+    // Use explicit float32 operations to match auto_LiRPA
+    torch::Tensor weight_t = weight.t().contiguous();
+    torch::Tensor matmul_result = torch::matmul(inputFloat, weight_t);
     torch::Tensor alpha_scaled = _alpha * matmul_result;
     
     // Add bias if defined

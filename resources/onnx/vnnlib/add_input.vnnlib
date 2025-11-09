@@ -1,0 +1,17 @@
+; VNNLIB file with two inputs bounded between 0 and 1
+
+; Declare input variables
+(declare-const X_0 Real)
+(declare-const X_1 Real)
+
+; Declare output variable
+(declare-const Y_0 Real)
+
+; Input constraints
+(assert (>= X_0 0.0))
+(assert (<= X_0 1.0))
+(assert (>= X_1 0.0))
+(assert (<= X_1 1.0))
+
+; Output constraint (property to verify)
+(assert (>= Y_0 0.0))

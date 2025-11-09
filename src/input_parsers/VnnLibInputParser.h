@@ -44,8 +44,8 @@ private:
     struct InputBoundInfo {
         bool hasLowerBound;
         bool hasUpperBound;
-        double lowerBound;
-        double upperBound;
+        double lowerBound;  // Keep as double for accurate parsing
+        double upperBound;  // Keep as double for accurate parsing
 
         InputBoundInfo()
             : hasLowerBound(false), hasUpperBound(false),

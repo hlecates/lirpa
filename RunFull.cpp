@@ -19,7 +19,7 @@ static void printBounds(const torch::Tensor& lower, const torch::Tensor& upper, 
         // Print with 6 decimal places when rounding
         std::cout << std::fixed << std::setprecision(6);
     } else {
-        // Print with full precision (typically 15 significant digits for float)
+        // Print with full precision (typically 15 significant digits for double)
         std::cout << std::scientific << std::setprecision(15);
     }
 
@@ -29,7 +29,8 @@ static void printBounds(const torch::Tensor& lower, const torch::Tensor& upper, 
         auto u = ub[i];
         if (l.dim() > 0) l = l.flatten()[0];
         if (u.dim() > 0) u = u.flatten()[0];
-        std::cout << "[" << l.item<float>() << ", " << u.item<float>() << "]";
+        // Use double for consistency with Python's float32 precision handling
+        std::cout << "[" << l.item<double>() << ", " << u.item<double>() << "]";
     }
     std::cout << std::endl;
     std::cout << std::defaultfloat;
@@ -40,6 +41,10 @@ int main(int argc, char* argv[]) {
     (void)argv;
 
     try {
+        // Force single-threaded execution for numerical determinism
+        at::set_num_threads(1);
+        at::set_num_interop_threads(1);
+        std::cout << "Set threads to 1 for deterministic results\n\n";
         // Configuration flags
         bool round = true;  // Set to false for full precision, true for 6 decimal places
 
@@ -48,11 +53,18 @@ int main(int argc, char* argv[]) {
         std::string onnxFilePath = "../resources/onnx/ACASXU_run2a_1_1_batch_2000.onnx";
         //std::string onnxFilePath = "../resources/onnx/mnist-point.onnx";
         //std::string onnxFilePath = "../resources/onnx/sat_v6_c27.onnx";
+        //std::string onnxFilePath = "../resources/onnx/layer-zoo/add.onnx";
+        //std::string onnxFilePath = "../resources/onnx/toy_add_complex.onnx";
+        //std::string onnxFilePath = "../resources/onnx/toy_matmul_add_chain.onnx";
+        //std::string onnxFilePath = "../resources/onnx/toy_sub_chain.onnx";
+
+
         
         //std::string vnnlibFilePath = "../resources/properties/deeper_network_test.vnnlib";
         std::string vnnlibFilePath = "../resources/onnx/vnnlib/prop_1.vnnlib";
         //std::string vnnlibFilePath = "../resources/onnx/vnnlib/mnist-img10.vnnlib";
         //std::string vnnlibFilePath = "../resources/onnx/vnnlib/sat_v6_c27.vnnlib";
+        //std::string vnnlibFilePath = "../resources/onnx/vnnlib/add_input.vnnlib";
 
 
         unsigned iterations = 20; 
@@ -116,12 +128,54 @@ int main(int argc, char* argv[]) {
         std::cout << "\nInput bounds loaded from VNN-LIB file:" << std::endl;
         torch::Tensor lowerBounds = inputBounds.lower();
         torch::Tensor upperBounds = inputBounds.upper();
+
+        // Verify and convert to float32 to match auto_LiRPA
+        std::cout << "Input bounds dtype: lower=" << lowerBounds.dtype()
+                  << ", upper=" << upperBounds.dtype() << std::endl;
+
+        if (lowerBounds.dtype() != torch::kFloat32) {
+            lowerBounds = lowerBounds.to(torch::kFloat32);
+            upperBounds = upperBounds.to(torch::kFloat32);
+            inputBounds = BoundedTensor<torch::Tensor>(lowerBounds, upperBounds);
+            std::cout << "Converted input bounds to float32" << std::endl;
+        }
+
+        // Print input bounds with high precision to verify exact values
+        std::cout << std::fixed << std::setprecision(9);
         for (int i = 0; i < lowerBounds.size(0); ++i) {
             std::cout << "  X_" << i << ": [" << lowerBounds[i].item<double>()
                       << ", " << upperBounds[i].item<double>() << "]" << std::endl;
         }
+        std::cout << std::defaultfloat;
 
-        // Step 3: Configure analysis 
+        // Step 3: Run plain CROWN first
+        std::cout << "\nRunning plain CROWN analysis..." << std::endl;
+        BoundedTensor<torch::Tensor> crownResult = torchModel->compute_bounds(
+            inputBounds,
+            nullptr,  // No specification matrix
+            NLR::AnalysisConfig::Method::CROWN,
+            true,   // compute lower bounds
+            true    // compute upper bounds
+        );
+
+        std::cout << "\n=== CROWN Results ===" << std::endl;
+        if (crownResult.lower().defined() && crownResult.upper().defined()) {
+            std::cout << "Output dtype: lower=" << crownResult.lower().dtype()
+                      << ", upper=" << crownResult.upper().dtype() << std::endl;
+
+            // First print with 6 decimal places to match auto_LiRPA
+            printBounds(crownResult.lower(), crownResult.upper(), round);
+
+            // Also print with full precision for debugging
+            if (round) {
+                std::cout << "Full precision CROWN bounds:" << std::endl;
+                printBounds(crownResult.lower(), crownResult.upper(), false);
+            }
+        } else {
+            std::cout << "Bounds are undefined" << std::endl;
+        }
+
+        // Step 4: Configure analysis for Alpha-CROWN
         NLR::AnalysisConfig config;
         config.method = NLR::AnalysisConfig::Method::AlphaCROWN;
         config.alpha_iterations = iterations;
@@ -137,7 +191,7 @@ int main(int argc, char* argv[]) {
         std::cout << "  Iterations: " << iterations << std::endl;
         std::cout << "  Optimizing both lower and upper bounds" << std::endl;
 
-        // Step 4: Run analysis using unified compute_bounds() method
+        // Step 5: Run analysis using unified compute_bounds() method
         BoundedTensor<torch::Tensor> result = torchModel->compute_bounds(
             inputBounds,
             nullptr,  // No specification matrix
@@ -146,7 +200,7 @@ int main(int argc, char* argv[]) {
             true    // compute upper bounds
         );
 
-        // Step 5: Output the bounds
+        // Step 6: Output the bounds
         std::cout << "\n=== Alpha-CROWN Results ===" << std::endl;
         if (result.lower().defined() && result.upper().defined()) {
             printBounds(result.lower(), result.upper(), round);

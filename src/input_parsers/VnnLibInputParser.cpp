@@ -420,9 +420,9 @@ BoundedTensor<torch::Tensor> VnnLibInputParser::parseInputBounds(const String &v
         }
     }
 
-    // Convert to torch tensors
-    torch::Tensor lowerBounds = torch::zeros({(long)expectedInputSize}, torch::kFloat32);
-    torch::Tensor upperBounds = torch::zeros({(long)expectedInputSize}, torch::kFloat32);
+    // Convert to torch tensors - use double precision first for accurate parsing
+    torch::Tensor lowerBounds = torch::zeros({(long)expectedInputSize}, torch::kFloat64);
+    torch::Tensor upperBounds = torch::zeros({(long)expectedInputSize}, torch::kFloat64);
 
     for (unsigned i = 0; i < expectedInputSize; ++i)
     {
@@ -434,10 +434,15 @@ BoundedTensor<torch::Tensor> VnnLibInputParser::parseInputBounds(const String &v
         else
         {
             // No bounds specified, use infinity
-            lowerBounds[i] = -std::numeric_limits<float>::infinity();
-            upperBounds[i] = std::numeric_limits<float>::infinity();
+            lowerBounds[i] = -std::numeric_limits<double>::infinity();
+            upperBounds[i] = std::numeric_limits<double>::infinity();
         }
     }
+
+    // Now convert to float32 to match Python's precision
+    // This ensures the conversion happens in the same way as Python
+    lowerBounds = lowerBounds.to(torch::kFloat32);
+    upperBounds = upperBounds.to(torch::kFloat32);
 
 //     std::cout << "[VnnLibInputParser] ========== VNN-LIB Parsing Complete ==========" << std::endl << std::endl;
 

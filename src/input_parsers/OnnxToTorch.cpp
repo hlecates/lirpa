@@ -1413,11 +1413,6 @@ namespace BoundedOperationConverter {
             // For flatten, input and output sizes are the same (total number of elements preserved)
             outputSize = inputSize;
 
-//             std::cout << "[OnnxToTorch::convertFlatten] Input shape: ";
-            // for (unsigned dim : inputShape) {
-            //     std::cout << dim << " ";
-            // }
-            // std::cout << ", axis: " << axis << ", total size: " << inputSize << std::endl;
         }
 
         // Create flatten module with the specified axis
@@ -1437,8 +1432,14 @@ namespace BoundedOperationConverter {
             }
             boundedNode->setInputShape(shapeVec);
 
-//             std::cout << "[OnnxToTorch::convertFlatten] Set sizes for Flatten node: input="
-//                       << inputSize << ", output=" << outputSize << std::endl;
+            std::cout << "[OnnxToTorch::convertFlatten] Shape vector for backward: [";
+            for (size_t i = 0; i < shapeVec.size(); ++i) {
+                std::cout << shapeVec[i];
+                if (i < shapeVec.size() - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
+            std::cout << "[OnnxToTorch::convertFlatten] Successfully set sizes for Flatten node" << std::endl;
+            std::cout << "[OnnxToTorch::convertFlatten] ======================================\n" << std::endl;
         }
 
         return boundedNode;

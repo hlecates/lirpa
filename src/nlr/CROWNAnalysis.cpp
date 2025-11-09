@@ -76,34 +76,51 @@ void CROWNAnalysis::run()
 void CROWNAnalysis::computeIBPBounds()
 {
     resetProcessingState();
-    Vector<unsigned> forwardOrder = _torchModel->topologicalSort(); 
-    
+    Vector<unsigned> forwardOrder = _torchModel->topologicalSort();
+
+    log(Stringf("computeIBPBounds() - Processing %u nodes", forwardOrder.size()));
+
     for (unsigned nodeIndex : forwardOrder) {
 
         if (isProcessed(nodeIndex)) continue;
         markProcessed(nodeIndex);
 
         auto& node = _nodes[nodeIndex];
-        
+
+        log(Stringf("computeIBPBounds() - Node %u (type=%s)", nodeIndex, nodeTypeToString(node->getNodeType()).c_str()));
+
         // Get input bounds for this node
         Vector<BoundedTensor<torch::Tensor>> inputBounds = getInputBoundsForNode(nodeIndex);
-        
+
+        log(Stringf("computeIBPBounds() - Node %u has %u input bounds", nodeIndex, inputBounds.size()));
+
         // For the input node, if explicit input bounds exist, store and continue
         if (node->getNodeType() == NodeType::INPUT) {
             if (_torchModel->hasInputBounds()) {
                 torch::Tensor inputLower = _torchModel->getInputLowerBounds();
                 torch::Tensor inputUpper = _torchModel->getInputUpperBounds();
                 _ibpBounds[nodeIndex] = BoundedTensor<torch::Tensor>(inputLower, inputUpper);
+                log(Stringf("computeIBPBounds() - Node %u (INPUT) stored with bounds shape [%lld]",
+                    nodeIndex, (long long)inputLower.size(0)));
                 continue;
             }
         }
 
         // Compute IBP bounds (same computation for all node types)
         BoundedTensor<torch::Tensor> ibpBounds = node->computeIntervalBoundPropagation(inputBounds);
-        
+
         // Store IBP bounds
         _ibpBounds[nodeIndex] = ibpBounds;
+
+        if (ibpBounds.lower().defined() && ibpBounds.upper().defined()) {
+            log(Stringf("computeIBPBounds() - Node %u stored IBP bounds: lower shape [%lld], upper shape [%lld]",
+                nodeIndex, (long long)ibpBounds.lower().size(0), (long long)ibpBounds.upper().size(0)));
+        } else {
+            log(Stringf("computeIBPBounds() - Node %u WARNING: IBP bounds are undefined!", nodeIndex));
+        }
     }
+
+    log(Stringf("computeIBPBounds() - Completed, stored bounds for %u nodes", _ibpBounds.size()));
 }
 
 void CROWNAnalysis::backwardFrom(unsigned startIndex)
@@ -212,6 +229,8 @@ void CROWNAnalysis::clearCrownState()
 
 void CROWNAnalysis::concretizeNode(unsigned startIndex)
 {
+    log(Stringf("concretizeNode() - Starting concretization for node %u", startIndex));
+
     // Determine input node index
     int inputIndex = -1;
     for (const auto &p : _nodes) {
@@ -220,10 +239,17 @@ void CROWNAnalysis::concretizeNode(unsigned startIndex)
             break;
         }
     }
+
+    log(Stringf("concretizeNode() - Input node index: %d", inputIndex));
+
     if (inputIndex < 0) {
+        log(Stringf("concretizeNode() - No input node found, using IBP bounds for node %u", startIndex));
         if (_ibpBounds.exists(startIndex)) {
             _concreteBounds[startIndex] = _ibpBounds[startIndex];
             _torchModel->setConcreteBounds(startIndex, _ibpBounds[startIndex]);
+            log(Stringf("concretizeNode() - Stored IBP bounds as concrete bounds for node %u", startIndex));
+        } else {
+            log(Stringf("concretizeNode() - WARNING: No IBP bounds available for node %u", startIndex));
         }
         return;
     }
@@ -241,11 +267,19 @@ void CROWNAnalysis::concretizeNode(unsigned startIndex)
     inputLower = inputLower.to(torch::kFloat32);
     inputUpper = inputUpper.to(torch::kFloat32);
 
+    log(Stringf("concretizeNode() - Checking for A matrices at input node %d", inputIndex));
+    log(Stringf("concretizeNode() - _lA.exists(%d)=%d, _uA.exists(%d)=%d",
+        inputIndex, _lA.exists(inputIndex), inputIndex, _uA.exists(inputIndex)));
+
     // Retrieve A and bias at input node (w.r.t. this start node)
     if (!_lA.exists(inputIndex) && !_uA.exists(inputIndex)) {
+        log(Stringf("concretizeNode() - No A matrices at input node, using IBP bounds for node %u", startIndex));
         if (_ibpBounds.exists(startIndex)) {
             _concreteBounds[startIndex] = _ibpBounds[startIndex];
             _torchModel->setConcreteBounds(startIndex, _ibpBounds[startIndex]);
+            log(Stringf("concretizeNode() - Stored IBP bounds as concrete bounds for node %u", startIndex));
+        } else {
+            log(Stringf("concretizeNode() - WARNING: No IBP bounds available for node %u", startIndex));
         }
         return;
     }
@@ -270,16 +304,27 @@ void CROWNAnalysis::concretizeNode(unsigned startIndex)
     torch::Tensor concreteLower, concreteUpper;
     computeConcreteBounds(lA, uA, lBias, uBias, inputLower, inputUpper, concreteLower, concreteUpper);
 
+    log(Stringf("concretizeNode() - Computed concrete bounds: lower.defined()=%d, upper.defined()=%d",
+        concreteLower.defined(), concreteUpper.defined()));
+
     if (concreteLower.defined() && concreteUpper.defined()) {
         BoundedTensor<torch::Tensor> concreteBounds(concreteLower, concreteUpper);
         _concreteBounds[startIndex] = concreteBounds;
         _torchModel->setConcreteBounds(startIndex, concreteBounds);
+        log(Stringf("concretizeNode() - Stored CROWN concrete bounds for node %u", startIndex));
     } else {
+        log(Stringf("concretizeNode() - CROWN bounds undefined, falling back to IBP for node %u", startIndex));
         if (_ibpBounds.exists(startIndex)) {
             _concreteBounds[startIndex] = _ibpBounds[startIndex];
             _torchModel->setConcreteBounds(startIndex, _ibpBounds[startIndex]);
+            log(Stringf("concretizeNode() - Stored IBP bounds as concrete bounds for node %u", startIndex));
+        } else {
+            log(Stringf("concretizeNode() - WARNING: No IBP bounds available for node %u", startIndex));
         }
     }
+
+    log(Stringf("concretizeNode() - Finished, _concreteBounds.exists(%u)=%d",
+        startIndex, _concreteBounds.exists(startIndex)));
 }
 
 // Helper function for establishing consistent tensor format (following auto-LiRPA's _preprocess_C)
@@ -473,9 +518,23 @@ torch::Tensor CROWNAnalysis::addA(const torch::Tensor& A1, const torch::Tensor& 
     // Enforce shape consistency - this forces consistent (1, spec, n) everywhere
     // and avoids "randomly worse" steps caused by shape collapse
     if (A1.sizes() != A2.sizes()) {
+        std::string shape1_str = "[";
+        for (int i = 0; i < A1.dim(); ++i) {
+            shape1_str += std::to_string(A1.size(i));
+            if (i < A1.dim() - 1) shape1_str += ", ";
+        }
+        shape1_str += "]";
+
+        std::string shape2_str = "[";
+        for (int i = 0; i < A2.dim(); ++i) {
+            shape2_str += std::to_string(A2.size(i));
+            if (i < A2.dim() - 1) shape2_str += ", ";
+        }
+        shape2_str += "]";
+
         throw std::runtime_error(
-            "CROWNAnalysis::addA - A shape mismatch: A1.sizes()=" +
-            std::to_string(A1.dim()) + " vs A2.sizes()=" + std::to_string(A2.dim()));
+            "CROWNAnalysis::addA - A shape mismatch: A1.shape=" + shape1_str +
+            " vs A2.shape=" + shape2_str);
     }
 
     return A1 + A2;

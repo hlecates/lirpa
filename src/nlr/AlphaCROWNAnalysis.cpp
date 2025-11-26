@@ -7,7 +7,42 @@
 #include "LirpaError.h"
 #include "TimeUtils.h"
 
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+
 namespace NLR {
+
+// Helper function to write debug info to log file
+static void writeToDebugLog(const std::string& message) {
+    std::ofstream logFile("crown_debug_cpp.log", std::ios::app);
+    if (logFile.is_open()) {
+        logFile << message;
+        logFile.close();
+    }
+}
+
+// Helper function to get first N elements of a tensor as a string
+static std::string tensorFirstN(const torch::Tensor& tensor, int n = 10) {
+    if (!tensor.defined() || tensor.numel() == 0) {
+        return "[]";
+    }
+    
+    auto flat = tensor.flatten();
+    int count = std::min(n, (int)flat.numel());
+    
+    std::ostringstream oss;
+    oss << "[";
+    for (int i = 0; i < count; ++i) {
+        if (i > 0) oss << ", ";
+        oss << std::fixed << std::setprecision(6) << flat[i].item<float>();
+    }
+    if (flat.numel() > count) {
+        oss << ", ...";
+    }
+    oss << "]";
+    return oss.str();
+}
 
 AlphaCROWNAnalysis::AlphaCROWNAnalysis(TorchModel* torchModel)
     : _torchModel(torchModel)
@@ -23,6 +58,7 @@ AlphaCROWNAnalysis::AlphaCROWNAnalysis(TorchModel* torchModel)
 
     // Create CROWN analysis instance
     _crownAnalysis = std::make_unique<CROWNAnalysis>(_torchModel);
+    //_crownAnalysis = std::make_unique<CROWNAnalysis>(_torchModel, false);
 }
 
 AlphaCROWNAnalysis::~AlphaCROWNAnalysis()
@@ -281,15 +317,23 @@ AlphaParameters& AlphaCROWNAnalysis::ensureAlphaFor(
         auto alpha_init = slope_init.view({1, 1, outDim}).expand({specDim, 1, outDim});
         alpha.copy_(alpha_init);
 
-        // DEBUG: Log alpha initialization (disabled for clean output)
-        // if (nodeIndex < 10) {  // Only log first few nodes to avoid spam
-        //     printf("[DEBUG ensureAlphaFor] Node %u, start=%s, bound=%s: slope_init dtype=%s, min=%.6f, max=%.6f, mean=%.6f\n",
-        //            nodeIndex, startKey.c_str(), isLower ? "LOWER" : "UPPER",
-        //            torch::toString(slope_init.dtype()).c_str(),
-        //            slope_init.min().item<float>(),
-        //            slope_init.max().item<float>(),
-        //            slope_init.mean().item<float>());
-        // }
+        // CROWN DEBUG: Log alpha initialization (to file)
+        {
+            std::ostringstream oss;
+            auto node = _torchModel->getNode(nodeIndex);
+            std::string nodeName = node ? node->getNodeName().ascii() : std::to_string(nodeIndex);
+            
+            oss << "\n[CROWN ALPHA INIT] " << nodeName << ", start=" << startKey
+                << ", bound=" << (isLower ? "LOWER" : "UPPER") << "\n";
+            oss << "  Alpha (first 10): " << tensorFirstN(alpha_init) << "\n";
+            oss << "  Alpha: min=" << std::fixed << std::setprecision(6)
+                << alpha_init.min().item<float>()
+                << ", max=" << alpha_init.max().item<float>()
+                << ", mean=" << alpha_init.mean().item<float>()
+                << ", shape=[" << specDim << "," << 1L << "," << outDim << "]\n";
+            
+            writeToDebugLog(oss.str());
+        }
 
         // NOW enable gradients after initialization
         alpha = alpha.detach().requires_grad_(true);
@@ -436,6 +480,39 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(BoundSide side)
                loss.defined() ? loss.item<float>() : 0.0f,
                currentLR,
                improved ? " *improved*" : "");
+
+        // CROWN DEBUG: Print alpha values for this iteration (to file)
+        {
+            std::ostringstream oss;
+            oss << "\n[CROWN ALPHA VALUES - Iteration " << iter << "]\n";
+            
+            // Get the appropriate storage based on bound side
+            auto& storageMap = isLower ? _alphaByNodeStartLower : _alphaByNodeStartUpper;
+            
+            for (auto& [nodeIdx, perStart] : storageMap) {
+                for (auto& [startKey, ap] : perStart) {
+                    if (ap.alpha.defined()) {
+                        auto node = _torchModel->getNode(nodeIdx);
+                        std::string nodeName = node ? node->getNodeName().ascii() : std::to_string(nodeIdx);
+                        
+                        oss << "  Layer " << nodeName << ", Alpha '" << startKey << "':\n";
+                        oss << "    Values (first 10): " << tensorFirstN(ap.alpha) << "\n";
+                        oss << "    Stats: mean=" << std::fixed << std::setprecision(6)
+                            << ap.alpha.mean().item<float>()
+                            << ", min=" << ap.alpha.min().item<float>()
+                            << ", max=" << ap.alpha.max().item<float>()
+                            << ", shape=[";
+                        auto shape = ap.alpha.sizes();
+                        for (size_t i = 0; i < shape.size(); ++i) {
+                            if (i > 0) oss << ", ";
+                            oss << shape[i];
+                        }
+                        oss << "]\n";
+                    }
+                }
+            }
+            writeToDebugLog(oss.str());
+        }
 
         // Gradient step (except on last iteration)
         if (iter < _iteration - 1 && loss.defined()) {

@@ -8,13 +8,10 @@ BoundedIdentityNode::BoundedIdentityNode(const torch::nn::Identity& identityModu
     _nodeIndex = 0;
     _input_size = 0;  // Will be set dynamically
     _output_size = 0; // Will be set dynamically
-    std::cout << "[BoundedIdentityNode] Constructor called with name: " << _nodeName << std::endl;
 }
 
 // Standard PyTorch forward pass
 torch::Tensor BoundedIdentityNode::forward(const torch::Tensor& input) {
-    std::cout << "[BoundedIdentityNode] Forward called with input shape: " << input.sizes() << std::endl;
-    
     // Update input/output sizes dynamically
     if (input.dim() > 0) {
         _input_size = input.numel();
@@ -23,79 +20,55 @@ torch::Tensor BoundedIdentityNode::forward(const torch::Tensor& input) {
     
     // Apply identity transformation
     torch::Tensor output = _identity_module->forward(input);
-    std::cout << "[BoundedIdentityNode] Forward output shape: " << output.sizes() << std::endl;
     return output;
 }
 
 // Auto-LiRPA style boundBackward method (NEW)
 // Identity layers simply pass through the A matrices without modification
 void BoundedIdentityNode::boundBackward(
-    const torch::Tensor& last_lA, 
-    const torch::Tensor& last_uA,
+    const BoundA& last_lA, 
+    const BoundA& last_uA,
     const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
-    Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+    Vector<Pair<BoundA, BoundA>>& outputA_matrices,
     torch::Tensor& lbias,
     torch::Tensor& ubias) {
-    
-    std::cout << "[BoundedIdentityNode::boundBackward] Starting boundBackward" << std::endl;
-    std::cout << "[BoundedIdentityNode::boundBackward] last_lA defined: " << last_lA.defined() << std::endl;
-    std::cout << "[BoundedIdentityNode::boundBackward] last_uA defined: " << last_uA.defined() << std::endl;
-    std::cout << "[BoundedIdentityNode::boundBackward] lbias defined: " << lbias.defined() << std::endl;
-    std::cout << "[BoundedIdentityNode::boundBackward] ubias defined: " << ubias.defined() << std::endl;
-    std::cout << "[BoundedIdentityNode::boundBackward] inputBounds size: " << inputBounds.size() << std::endl;
-    
-    if (last_lA.defined()) {
-        std::cout << "[BoundedIdentityNode::boundBackward] last_lA shape: " << last_lA.sizes() << std::endl;
-    }
-    if (last_uA.defined()) {
-        std::cout << "[BoundedIdentityNode::boundBackward] last_uA shape: " << last_uA.sizes() << std::endl;
-    }
     
     if (inputBounds.size() < 1) {
         throw std::runtime_error("BoundedIdentityNode expects at least one input");
     }
 
     // Identity layers don't modify the linear relationships
-    // Simply pass through the A matrices
+    // Simply pass through the A matrices (works for both Tensor and Patches)
     outputA_matrices.clear();
-    outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(last_lA, last_uA));
-    std::cout << "[BoundedIdentityNode::boundBackward] Added A matrices to output" << std::endl;
+    outputA_matrices.append(Pair<BoundA, BoundA>(last_lA, last_uA));
     
-    // Identity layers don't add bias - initialize to zeros with correct size
-    if (last_lA.defined()) {
-        // Get the output size from the A matrix
-        int output_size = last_lA.size(1); // Second dimension is output size
-        std::cout << "[BoundedIdentityNode::boundBackward] Output size from A matrix: " << output_size << std::endl;
-        
-        if (!lbias.defined()) {
-            lbias = torch::zeros({output_size});
-            std::cout << "[BoundedIdentityNode::boundBackward] Initialized lbias to zeros with size: " << output_size << std::endl;
-        }
-    } else {
-        if (!lbias.defined()) {
-            lbias = torch::zeros({1});
-            std::cout << "[BoundedIdentityNode::boundBackward] Initialized lbias to zeros (fallback)" << std::endl;
+    // Identity layers don't add bias - initialize to zeros with correct size if needed
+    // If bias is already accumulated externally, we don't need to zero it here, but here we return lbias/ubias contribution.
+    // Identity contribution is 0.
+    // But we need to return shaped zero tensor if we want to be rigorous, or undefined/empty if that's handled.
+    // auto_LiRPA returns bias=0.
+    
+    if (last_lA.isTensor()) {
+        torch::Tensor lA = last_lA.asTensor();
+        if (lA.defined()) {
+            int output_size = lA.size(1);
+            if (!lbias.defined()) lbias = torch::zeros({output_size});
+        } else {
+            if (!lbias.defined()) lbias = torch::zeros({1});
         }
     }
+    // If Patches, we can leave undefined (implying 0) or handle it.
+    // Usually bias is accumulated. If we return undefined, it means 0 contribution.
     
-    if (last_uA.defined()) {
-        // Get the output size from the A matrix
-        int output_size = last_uA.size(1); // Second dimension is output size
-        std::cout << "[BoundedIdentityNode::boundBackward] Output size from A matrix: " << output_size << std::endl;
-        
-        if (!ubias.defined()) {
-            ubias = torch::zeros({output_size});
-            std::cout << "[BoundedIdentityNode::boundBackward] Initialized ubias to zeros with size: " << output_size << std::endl;
-        }
-    } else {
-        if (!ubias.defined()) {
-            ubias = torch::zeros({1});
-            std::cout << "[BoundedIdentityNode::boundBackward] Initialized ubias to zeros (fallback)" << std::endl;
+    if (last_uA.isTensor()) {
+        torch::Tensor uA = last_uA.asTensor();
+        if (uA.defined()) {
+            int output_size = uA.size(1);
+            if (!ubias.defined()) ubias = torch::zeros({output_size});
+        } else {
+            if (!ubias.defined()) ubias = torch::zeros({1});
         }
     }
-    
-    std::cout << "[BoundedIdentityNode::boundBackward] Final lbias shape: " << lbias.sizes() << std::endl;
-    std::cout << "[BoundedIdentityNode::boundBackward] Final ubias shape: " << ubias.sizes() << std::endl;
 }
 
 
@@ -124,7 +97,6 @@ BoundedTensor<torch::Tensor> BoundedIdentityNode::computeIntervalBoundPropagatio
     // Set input size from the input tensor during IBP
     if (_input_size == 0 && inputLowerBound.defined()) {
         _input_size = inputLowerBound.numel();
-        std::cout << "[BoundedIdentityNode::computeIntervalBoundPropagation] Set input size to " << _input_size << std::endl;
     }
     
     // Identity layer just passes through the bounds
@@ -134,7 +106,6 @@ BoundedTensor<torch::Tensor> BoundedIdentityNode::computeIntervalBoundPropagatio
     // Set output size from the computed bounds during IBP (same as input for identity)
     if (_output_size == 0 && lowerBound.defined()) {
         _output_size = lowerBound.numel();
-        std::cout << "[BoundedIdentityNode::computeIntervalBoundPropagation] Set output size to " << _output_size << std::endl;
     }
     
     return BoundedTensor<torch::Tensor>(lowerBound, upperBound);
@@ -164,4 +135,4 @@ unsigned BoundedIdentityNode::getInputSize() const {
     return _input_size;
 }
 
-} // namespace NLR 
+} // namespace NLR

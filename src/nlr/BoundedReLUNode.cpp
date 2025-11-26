@@ -1,9 +1,22 @@
 #include "BoundedReLUNode.h"
 #include "AlphaCROWNAnalysis.h"
 #include "GlobalConfiguration.h"
+#include "Patches.h"
 #include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 
 namespace NLR {
+
+// Helper function to write debug info to log file
+static void writeToDebugLog(const std::string& message) {
+    std::ofstream logFile("crown_debug_cpp.log", std::ios::app);
+    if (logFile.is_open()) {
+        logFile << message;
+        logFile.close();
+    }
+}
 
 BoundedReLUNode::BoundedReLUNode(const torch::nn::ReLU& reluModule, const String& name)
     : BoundedAlphaOptimizeNode()
@@ -28,10 +41,10 @@ torch::Tensor BoundedReLUNode::forward(const torch::Tensor& input) {
 
 // Auto-LiRPA style boundBackward method
 void BoundedReLUNode::boundBackward(
-    const torch::Tensor& last_lA,
-    const torch::Tensor& last_uA,
+    const BoundA& last_lA,
+    const BoundA& last_uA,
     const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
-    Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+    Vector<Pair<BoundA, BoundA>>& outputA_matrices,
     torch::Tensor& lbias,
     torch::Tensor& ubias) {
 
@@ -45,20 +58,17 @@ void BoundedReLUNode::boundBackward(
 
     // Extract live spec dimension from last_lA or last_uA for per-spec alpha
     int specDim = 1;
-    if (last_lA.defined() && last_lA.dim() >= 2) {
-        specDim = (int)last_lA.size(1);  // Shape: [1, spec, out]
-    } else if (last_uA.defined() && last_uA.dim() >= 2) {
-        specDim = (int)last_uA.size(1);  // Shape: [1, spec, out]
+    if (last_lA.isTensor() && last_lA.asTensor().defined() && last_lA.asTensor().dim() >= 2) {
+        specDim = (int)last_lA.asTensor().size(1);  // Shape: [1, spec, out]
+    } else if (last_uA.isTensor() && last_uA.asTensor().defined() && last_uA.asTensor().dim() >= 2) {
+        specDim = (int)last_uA.asTensor().size(1);  // Shape: [1, spec, out]
     }
     _currentSpecDim = specDim;  // Store for use in _maskAlpha
 
-    // Call the unified backward relaxation method (following auto_LiRPA approach)
-    // This method handles both 'init' and 'opt' stages internally
+    // Call the unified backward relaxation method
     auto relaxation_result = _backwardRelaxation(last_lA, last_uA, input_lower, input_upper);
 
-    // LOWER objective uses (aL, aU) = (lb_lower_d, lb_upper_d) with (bL, bU) = (bias_lower, bias_upper)
-    // UPPER objective uses (aU, aL) = (ub_upper_d, lb_lower_d) with (bU, bL) = (bias_upper, bias_lower)
-
+    // Helper lambdas
     auto expand_like = [](torch::Tensor v, const torch::Tensor& A) {
         if (!v.defined()) return v;
         int add_dims = A.dim() - v.dim();
@@ -70,66 +80,231 @@ void BoundedReLUNode::boundBackward(
         // sum over the last `in_ndim` dims
         std::vector<int64_t> dims;
         for (int i = term.dim() - in_ndim; i < term.dim(); ++i) dims.push_back(i);
-        return term.sum(dims);  // keeps leading batch/spec dims (if any)
+        return term.sum(dims);
     };
 
-    torch::Tensor new_lA, new_uA;
+    BoundA new_lA, new_uA;
 
     // ----- LOWER path -----
     if (last_lA.defined()) {
-        auto Apos = torch::clamp_min(last_lA, 0);
-        auto Aneg = torch::clamp_max(last_lA, 0);
-
-        // Use separate slopes if available (optimization mode), otherwise fall back to unified slopes (init mode)
         auto aL_l = relaxation_result.lb_lower_d.defined() ? relaxation_result.lb_lower_d : relaxation_result.d_lower;
         auto aU_l = relaxation_result.lb_upper_d.defined() ? relaxation_result.lb_upper_d : relaxation_result.d_upper;
         auto bL_l = relaxation_result.bias_lower.defined() ? relaxation_result.bias_lower : torch::zeros_like(input_lower);
         auto bU_l = relaxation_result.bias_upper.defined() ? relaxation_result.bias_upper : torch::zeros_like(input_lower);
 
-        auto A_l = Apos * expand_like(aL_l, last_lA) + Aneg * expand_like(aU_l, last_lA);
-        auto b_l = Apos * expand_like(bL_l, last_lA) + Aneg * expand_like(bU_l, last_lA);
+        if (last_lA.isTensor()) {
+            torch::Tensor lA = last_lA.asTensor();
+            auto Apos = torch::clamp_min(lA, 0);
+            auto Aneg = torch::clamp_max(lA, 0);
 
-        new_lA = A_l;
-        auto add_lbias = reduce_bias(b_l, /*in_ndim=*/input_lower.dim());
+            auto A_l = Apos * expand_like(aL_l, lA) + Aneg * expand_like(aU_l, lA);
+            auto b_l = Apos * expand_like(bL_l, lA) + Aneg * expand_like(bU_l, lA);
 
-        // accumulate instead of overwrite
-        lbias = lbias.defined() ? (lbias + add_lbias) : add_lbias;
+            new_lA = BoundA(A_l);
+            auto add_lbias = reduce_bias(b_l, /*in_ndim=*/input_lower.dim());
+            lbias = lbias.defined() ? (lbias + add_lbias) : add_lbias;
+        } else {
+            // Patches mode
+            auto patches = last_lA.asPatches();
+            
+            // maybe_unfold_patches
+            torch::Tensor aL_l_unfolded = maybe_unfold_patches(aL_l, last_lA);
+            torch::Tensor aU_l_unfolded = maybe_unfold_patches(aU_l, last_lA);
+            
+            // Patches doesn't support clamp directly on object, need to use patches tensor
+            torch::Tensor P = patches->patches;
+            torch::Tensor Ppos = torch::clamp_min(P, 0);
+            torch::Tensor Pneg = torch::clamp_max(P, 0);
+            
+            // Multiply unfolded slopes
+            // Shapes should match or broadcast
+            torch::Tensor P_new = Ppos * aL_l_unfolded + Pneg * aU_l_unfolded;
+            
+            new_lA = BoundA(patches->create_similar(P_new));
+            
+            // Bias handling for patches?
+            // auto_LiRPA: "If sum_bias was handled in Conv, it propagates here?"
+            // Actually bias in ReLU relaxation (linear part b) needs to be added to bias accumulator.
+            // But how to reduce bias from patches?
+            // Patches are W. A * b (where b is bias vector).
+            // Here b is per-element bias map (from relaxation).
+            // It's essentially A * bias_map.
+            // We need to compute A * bias_map.
+            // A is patches. bias_map is bL_l/bU_l (same shape as input_lower).
+            // We can use patches.matmul(bias_map).
+            
+            // Patches::matmul(input, patch_abs=False)
+            // b_l term in tensor mode was: Apos * bL + Aneg * bU.
+            // Here: Ppos.matmul(bL_l) + Pneg.matmul(bU_l).
+            
+            // We need to implement matmul logic or similar.
+            // Patches::matmul in python does: unfold input, multiply with patches, sum.
+            // This results in output shape.
+            
+            // Since I haven't implemented Patches::matmul in C++, I might need to skip bias or implement it.
+            // Or use fallback if needed.
+            
+            // Wait, bias is accumulated in lbias/ubias which are Tensors (output shape).
+            // So we DO need to reduce patches * bias_map to tensor.
+            
+            // I will use a simplified calculation if possible or throw warning.
+            // Assuming 0 bias contribution for now to avoid crash, but this is incorrect for unstable ReLUs.
+            // Unstable ReLUs have non-zero bias in upper bound relaxation (and lower if adaptive).
+            
+            // Implementing unfold + sum here locally?
+            // Using inplace_unfold on bias_map (input).
+            
+            // Bias map shape: [N, C, H, W]
+            // Output shape: [N, out_C, out_H, out_W] (implied by patches)
+            
+            // TODO: Implement correct bias propagation for Patches in ReLU
+            // For now, we might miss the relaxation bias.
+            // But if alpha-CROWN optimization is used, biases are critical.
+            
+            // If I can use `inplace_unfold`...
+            // bias_map: [N, C, H, W]
+            
+            // Expand bias if [C, H, W] -> [1, C, H, W]
+            if (bL_l.dim() == 3) bL_l = bL_l.unsqueeze(0);
+            if (bU_l.dim() == 3) bU_l = bU_l.unsqueeze(0);
+            
+            // Unfold
+            torch::Tensor bL_unfolded = inplace_unfold(bL_l, 
+                {patches->patches.size(-2), patches->patches.size(-1)}, 
+                patches->stride, patches->padding, patches->inserted_zeros, patches->output_padding);
+            
+            // bL_unfolded: [N, patches_h, patches_w, C, kh, kw]
+            // Ppos: [out_c, batch, out_h, out_w, C, kh, kw]
+            
+            // Permute bL to match Ppos somewhat?
+            // Ppos dims: 0:out_c, 1:batch, 2:out_h, 3:out_w, 4:C, 5:kh, 6:kw
+            
+            // bL_unfolded: 0:batch, 1:out_h, 2:out_w, 3:C, 4:kh, 5:kw
+            // broadcast to Ppos: unsqueeze 0 (out_c)
+            
+            torch::Tensor bL_ready = bL_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
+            // [1, batch, out_h, out_w, C, kh, kw]
 
-        if (outputA_matrices.size() == 0) outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(torch::Tensor(), torch::Tensor()));
-        outputA_matrices[0].first() = new_lA;
+            // Define bU_ready
+            torch::Tensor bU_unfolded = inplace_unfold(bU_l,
+                {patches->patches.size(-2), patches->patches.size(-1)},
+                patches->stride, patches->padding, patches->inserted_zeros, patches->output_padding);
+            torch::Tensor bU_ready = bU_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
+
+            // Ppos * bL_ready -> [out_c, batch, out_h, out_w, C, kh, kw]
+            // Sum over C, kh, kw -> [out_c, batch, out_h, out_w]
+            // Result is bias [batch, out_c, out_h, out_w]
+
+            torch::Tensor term1 = (Ppos * bL_ready).sum({-3, -2, -1});
+            torch::Tensor term2 = (Pneg * bU_ready).sum({-3, -2, -1});
+            
+            torch::Tensor total_bias = term1 + term2; // [out_c, batch, out_h, out_w]
+            
+            // Permute to [batch, out_c, out_h, out_w]
+            total_bias = total_bias.permute({1, 0, 2, 3});
+            
+            lbias = lbias.defined() ? (lbias + total_bias) : total_bias;
+        }
     }
 
     // ----- UPPER path -----
     if (last_uA.defined()) {
-        auto Apos = torch::clamp_min(last_uA, 0);
-        auto Aneg = torch::clamp_max(last_uA, 0);
-
-        // Use separate slopes if available (optimization mode), otherwise fall back to unified slopes (init mode)
-        auto aU_u = relaxation_result.ub_upper_d.defined()
-                  ? relaxation_result.ub_upper_d
-                  : relaxation_result.d_upper;
-        auto aL_u = relaxation_result.lb_lower_d.defined()
-                  ? relaxation_result.lb_lower_d
-                  : relaxation_result.d_lower;
+        auto aU_u = relaxation_result.ub_upper_d.defined() ? relaxation_result.ub_upper_d : relaxation_result.d_upper;
+        auto aL_u = relaxation_result.lb_lower_d.defined() ? relaxation_result.lb_lower_d : relaxation_result.d_lower;
         auto bU_u = relaxation_result.bias_upper.defined() ? relaxation_result.bias_upper : torch::zeros_like(input_lower);
         auto bL_u = relaxation_result.bias_lower.defined() ? relaxation_result.bias_lower : torch::zeros_like(input_lower);
 
-        auto A_u = Apos * expand_like(aU_u, last_uA) + Aneg * expand_like(aL_u, last_uA);
-        auto b_u = Apos * expand_like(bU_u, last_uA) + Aneg * expand_like(bL_u, last_uA);
+        if (last_uA.isTensor()) {
+            torch::Tensor uA = last_uA.asTensor();
+            auto Apos = torch::clamp_min(uA, 0);
+            auto Aneg = torch::clamp_max(uA, 0);
 
-        auto add_ubias = reduce_bias(b_u, /*in_ndim=*/input_lower.dim());
+            auto A_u = Apos * expand_like(aU_u, uA) + Aneg * expand_like(aL_u, uA);
+            auto b_u = Apos * expand_like(bU_u, uA) + Aneg * expand_like(bL_u, uA);
 
-        // accumulate instead of overwrite
-        ubias = ubias.defined() ? (ubias + add_ubias) : add_ubias;
-
-        if (outputA_matrices.size() == 0) outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(torch::Tensor(), torch::Tensor()));
-        outputA_matrices[0].second() = A_u;
+            new_uA = BoundA(A_u);
+            auto add_ubias = reduce_bias(b_u, /*in_ndim=*/input_lower.dim());
+            ubias = ubias.defined() ? (ubias + add_ubias) : add_ubias;
+        } else {
+            // Patches mode
+            auto patches = last_uA.asPatches();
+            
+            // maybe_unfold_patches
+            torch::Tensor aU_u_unfolded = maybe_unfold_patches(aU_u, last_uA);
+            torch::Tensor aL_u_unfolded = maybe_unfold_patches(aL_u, last_uA);
+            
+            torch::Tensor P = patches->patches;
+            torch::Tensor Ppos = torch::clamp_min(P, 0);
+            torch::Tensor Pneg = torch::clamp_max(P, 0);
+            
+            torch::Tensor P_new = Ppos * aU_u_unfolded + Pneg * aL_u_unfolded;
+            new_uA = BoundA(patches->create_similar(P_new));
+            
+            // Bias
+            if (bU_u.dim() == 3) bU_u = bU_u.unsqueeze(0);
+            if (bL_u.dim() == 3) bL_u = bL_u.unsqueeze(0);
+            
+            torch::Tensor bU_unfolded = inplace_unfold(bU_u, 
+                {patches->patches.size(-2), patches->patches.size(-1)}, 
+                patches->stride, patches->padding, patches->inserted_zeros, patches->output_padding);
+            torch::Tensor bU_ready = bU_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
+            
+            torch::Tensor bL_unfolded = inplace_unfold(bL_u, 
+                {patches->patches.size(-2), patches->patches.size(-1)}, 
+                patches->stride, patches->padding, patches->inserted_zeros, patches->output_padding);
+            torch::Tensor bL_ready = bL_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
+            
+            torch::Tensor term1 = (Ppos * bU_ready).sum({-3, -2, -1});
+            torch::Tensor term2 = (Pneg * bL_ready).sum({-3, -2, -1});
+            
+            torch::Tensor total_bias = term1 + term2; 
+            total_bias = total_bias.permute({1, 0, 2, 3});
+            
+            ubias = ubias.defined() ? (ubias + total_bias) : total_bias;
+        }
     }
 
     // Ensure outputA_matrices has the right structure if not already set
     if (outputA_matrices.size() == 0) {
-        outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(new_lA, new_uA));
+        outputA_matrices.append(Pair<BoundA, BoundA>(new_lA, new_uA));
     }
+}
+
+torch::Tensor BoundedReLUNode::maybe_unfold_patches(const torch::Tensor& d_tensor, const BoundA& last_A) {
+    if (!d_tensor.defined() || !last_A.isPatches()) {
+        return d_tensor;
+    }
+    auto patches = last_A.asPatches();
+    
+    // d_tensor shape: [N, C, H, W]
+    // Needs to unfold to match patches kernel [C, kh, kw] at each location
+    
+    if (d_tensor.dim() == 3) {
+        // [C, H, W] -> [1, C, H, W]
+        return maybe_unfold_patches(d_tensor.unsqueeze(0), last_A);
+    }
+    
+    // Use inplace_unfold
+    torch::Tensor d_unfolded = inplace_unfold(d_tensor, 
+        {patches->patches.size(-2), patches->patches.size(-1)}, 
+        patches->stride, patches->padding, patches->inserted_zeros, patches->output_padding);
+    
+    // d_unfolded: [N, patches_h, patches_w, C, kh, kw]
+    
+    // Permute to match patches: [out_c, batch, out_h, out_w, C, kh, kw]
+    // We need to broadcast/permute d_unfolded to this.
+    // d_unfolded corresponds to batch, out_h, out_w...
+    // P corresponds to out_c, batch, out_h, out_w...
+    
+    // Permute to [1, batch, patches_h, patches_w, C, kh, kw] (1 for out_c broadcast)
+    // 0:N -> 1
+    // 1:ph -> 2
+    // 2:pw -> 3
+    // 3:C -> 4
+    // 4:kh -> 5
+    // 5:kw -> 6
+    
+    return d_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
 }
 
 // IBP (Interval Bound Propagation): Fast interval-based bound computation for ReLU
@@ -188,12 +363,15 @@ void BoundedReLUNode::setOutputSize(unsigned size) {
 
 // Unified backward relaxation method (following auto_LiRPA approach)
 BoundedReLUNode::RelaxationResult BoundedReLUNode::_backwardRelaxation(
-    const torch::Tensor& last_lA, const torch::Tensor& last_uA,
+    const BoundA& last_lA, const BoundA& last_uA,
     const torch::Tensor& input_lower, const torch::Tensor& input_upper)
 {
-    (void)last_lA;  // Unused in simple implementation
-    (void)last_uA;  // Unused in simple implementation
-
+    // Note: last_lA/last_uA are BoundA now, but masking alpha logic expects tensor or info?
+    // _maskAlpha needs to know output dimensions if using alpha-CROWN.
+    // Patches mode handles dimensions differently.
+    // For now, _maskAlpha uses getAlphaForNodeAllSpecs.
+    // The dimensions are extracted inside _maskAlpha from input_lower.
+    
     RelaxationResult result;
 
     // Compute standard CROWN upper bound relaxation (secant line for unstable neurons)
@@ -390,7 +568,8 @@ void BoundedReLUNode::computeAlphaRelaxation(
     torch::Tensor& bias_upper) {
     
     // Use the unified backward relaxation method
-    auto result = _backwardRelaxation(last_lA, last_uA, input_lower, input_upper);
+    // Wrap tensors in BoundA
+    auto result = _backwardRelaxation(BoundA(last_lA), BoundA(last_uA), input_lower, input_upper);
     
     // Extract the computed slopes and biases
     d_lower = result.d_lower;

@@ -28,10 +28,10 @@ torch::Tensor NLR::BoundedInputNode::forward(const torch::Tensor& input) {
 }
 
 void NLR::BoundedInputNode::boundBackward(
-    const torch::Tensor& last_lA,
-    const torch::Tensor& last_uA,
+    const BoundA& last_lA,
+    const BoundA& last_uA,
     const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
-    Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+    Vector<Pair<BoundA, BoundA>>& outputA_matrices,
     torch::Tensor& lbias,
     torch::Tensor& ubias
 ) {
@@ -41,7 +41,7 @@ void NLR::BoundedInputNode::boundBackward(
     // Input nodes should pass through A matrices unchanged
     // They represent the final linear transformation to the input space
     outputA_matrices.clear();
-    outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(last_lA, last_uA));
+    outputA_matrices.append(Pair<BoundA, BoundA>(last_lA, last_uA));
     
     // Input nodes don't contribute to bias
     // The bias computation will be handled in concretizeBounds using input bounds

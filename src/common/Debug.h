@@ -26,6 +26,10 @@
 #define DEBUG( x )
 #endif
 
+#ifdef LOG
+#undef LOG
+#endif
+
 #ifndef NDEBUG
 #define LOG( x, f, y, ... )                                                                        \
     {                                                                                              \

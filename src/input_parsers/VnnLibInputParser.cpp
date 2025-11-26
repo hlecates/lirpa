@@ -92,11 +92,11 @@ Vector<String> VnnLibInputParser::tokenize(const String &vnnlibContent)
 
 //     std::cout << "[VnnLibInputParser] Generated " << tokens.size() << " tokens" << std::endl;
 //     std::cout << "[VnnLibInputParser] First 20 tokens: ";
-    for (unsigned i = 0; i < tokens.size() && i < 20; ++i)
-    {
-        std::cout << tokens[i].ascii() << " ";
-    }
-    std::cout << std::endl;
+    // for (unsigned i = 0; i < tokens.size() && i < 20; ++i)
+    // {
+    //     std::cout << tokens[i].ascii() << " ";
+    // }
+    // std::cout << std::endl;
 
     return tokens;
 }
@@ -405,20 +405,21 @@ BoundedTensor<torch::Tensor> VnnLibInputParser::parseInputBounds(const String &v
     }
 
 //     std::cout << "\n[VnnLibInputParser] Summary of extracted bounds:" << std::endl;
-    for (unsigned i = 0; i < expectedInputSize; ++i)
-    {
-        if (i < inputBounds.size())
-        {
-//             std::cout << "[VnnLibInputParser]   X_" << i << ": ["
-//                       << inputBounds[i].lowerBound << ", "
-//                       << inputBounds[i].upperBound << "]";
-            if (!inputBounds[i].hasLowerBound)
-                std::cout << " (lower=default)";
-            if (!inputBounds[i].hasUpperBound)
-                std::cout << " (upper=default)";
-            std::cout << std::endl;
-        }
-    }
+    // Debug loop - commented out to reduce output
+    // for (unsigned i = 0; i < expectedInputSize; ++i)
+    // {
+    //     if (i < inputBounds.size())
+    //     {
+    //         std::cout << "[VnnLibInputParser]   X_" << i << ": ["
+    //                   << inputBounds[i].lowerBound << ", "
+    //                   << inputBounds[i].upperBound << "]";
+    //         if (!inputBounds[i].hasLowerBound)
+    //             std::cout << " (lower=default)";
+    //         if (!inputBounds[i].hasUpperBound)
+    //             std::cout << " (upper=default)";
+    //         std::cout << std::endl;
+    //     }
+    // }
 
     // Convert to torch tensors - use double precision first for accurate parsing
     torch::Tensor lowerBounds = torch::zeros({(long)expectedInputSize}, torch::kFloat64);

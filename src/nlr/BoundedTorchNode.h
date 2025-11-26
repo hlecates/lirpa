@@ -7,6 +7,7 @@
 #include "Pair.h"
 #include "MString.h"
 #include "BoundedTensor.h"
+#include "BoundResult.h"
 
 // Undefine Warning macro to avoid conflict with PyTorch
 #ifdef Warning
@@ -23,7 +24,7 @@
 
 namespace NLR {
 
-enum class NodeType { INPUT, CONSTANT, LINEAR, RELU, RESHAPE, IDENTITY, SUB, FLATTEN, ADD };
+enum class NodeType { INPUT, CONSTANT, LINEAR, RELU, RESHAPE, IDENTITY, SUB, FLATTEN, ADD, CONV };
 
 class BoundedTorchNode : public torch::nn::Module {
 public:
@@ -48,10 +49,10 @@ public:
         const Vector<BoundedTensor<torch::Tensor>>& inputBounds) = 0;
     
     virtual void boundBackward(
-        const torch::Tensor& last_lA,
-        const torch::Tensor& last_uA,
+        const BoundA& last_lA,
+        const BoundA& last_uA,
         const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
-        Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+        Vector<Pair<BoundA, BoundA>>& outputA_matrices,
         torch::Tensor& lbias,
         torch::Tensor& ubias
     ) = 0;

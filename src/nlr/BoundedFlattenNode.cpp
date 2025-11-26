@@ -26,10 +26,10 @@ torch::Tensor BoundedFlattenNode::forward(const torch::Tensor& input) {
 // Auto-LiRPA style boundBackward method
 // Flatten operations are identical to Reshape - they don't change the linear relationships, just pass through A matrices
 void BoundedFlattenNode::boundBackward(
-    const torch::Tensor& last_lA,
-    const torch::Tensor& last_uA,
+    const BoundA& last_lA,
+    const BoundA& last_uA,
     const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
-    Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+    Vector<Pair<BoundA, BoundA>>& outputA_matrices,
     torch::Tensor& lbias,
     torch::Tensor& ubias) {
 
@@ -37,9 +37,15 @@ void BoundedFlattenNode::boundBackward(
         throw std::runtime_error("BoundedFlattenNode expects at least one input");
     }
 
+    if (last_lA.isPatches() || last_uA.isPatches()) {
+         throw std::runtime_error("BoundedFlattenNode: Patches propagation not implemented (convert to matrix)");
+    }
+    
+    torch::Tensor lA = last_lA.asTensor();
+    torch::Tensor uA = last_uA.asTensor();
+
     // Flatten operations don't change the linear relationships
     // We need to reshape the A matrices to match the input shape
-    // This is exactly like BoundReshape in the Python code: A.reshape(A.shape[0], A.shape[1], *self.input_shape[1:])
     auto _bound_oneside = [&](const torch::Tensor& A) -> torch::Tensor {
         if (!A.defined()) {
             return torch::Tensor();
@@ -67,48 +73,39 @@ void BoundedFlattenNode::boundBackward(
     };
 
     // Reshape both A matrices to match input shape
-    torch::Tensor reshaped_lA = _bound_oneside(last_lA);
-    torch::Tensor reshaped_uA = _bound_oneside(last_uA);
+    torch::Tensor reshaped_lA = _bound_oneside(lA);
+    torch::Tensor reshaped_uA = _bound_oneside(uA);
 
     // Pass through the reshaped A matrices
     outputA_matrices.clear();
-    outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(reshaped_lA, reshaped_uA));
+    outputA_matrices.append(Pair<BoundA, BoundA>(BoundA(reshaped_lA), BoundA(reshaped_uA)));
 
     // Flatten operations don't add bias - initialize to zeros with correct size
-    if (last_lA.defined()) {
+    if (lA.defined()) {
         // Get the output size from the A matrix
-        int output_size = last_lA.size(1); // Second dimension is output size
-        //std::cout << "[BoundedFlattenNode::boundBackward] Output size from A matrix: " << output_size << std::endl;
+        int output_size = lA.size(1); // Second dimension is output size
 
         if (!lbias.defined()) {
             lbias = torch::zeros({output_size});
-            //std::cout << "[BoundedFlattenNode::boundBackward] Initialized lbias to zeros with size: " << output_size << std::endl;
         }
     } else {
         if (!lbias.defined()) {
             lbias = torch::zeros({1});
-            //std::cout << "[BoundedFlattenNode::boundBackward] Initialized lbias to zeros (fallback)" << std::endl;
         }
     }
 
-    if (last_uA.defined()) {
+    if (uA.defined()) {
         // Get the output size from the A matrix
-        int output_size = last_uA.size(1); // Second dimension is output size
-        //std::cout << "[BoundedFlattenNode::boundBackward] Output size from A matrix: " << output_size << std::endl;
+        int output_size = uA.size(1); // Second dimension is output size
 
         if (!ubias.defined()) {
             ubias = torch::zeros({output_size});
-            //std::cout << "[BoundedFlattenNode::boundBackward] Initialized ubias to zeros with size: " << output_size << std::endl;
         }
     } else {
         if (!ubias.defined()) {
             ubias = torch::zeros({1});
-            //std::cout << "[BoundedFlattenNode::boundBackward] Initialized ubias to zeros (fallback)" << std::endl;
         }
     }
-
-    //std::cout << "[BoundedFlattenNode::boundBackward] Final lbias shape: " << lbias.sizes() << std::endl;
-    //std::cout << "[BoundedFlattenNode::boundBackward] Final ubias shape: " << ubias.sizes() << std::endl;
 }
 
 

@@ -33,10 +33,10 @@ public:
     // Auto-LiRPA style boundBackward method (NEW)
     // Returns: A matrices for inputs, lower bias, upper bias
     void boundBackward(
-        const torch::Tensor& last_lA, 
-        const torch::Tensor& last_uA,
+        const BoundA& last_lA, 
+        const BoundA& last_uA,
         const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
-        Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+        Vector<Pair<BoundA, BoundA>>& outputA_matrices,
         torch::Tensor& lbias,
         torch::Tensor& ubias
     ) override;

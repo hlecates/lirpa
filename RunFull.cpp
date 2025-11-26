@@ -50,24 +50,28 @@ int main(int argc, char* argv[]) {
 
         
         //std::string onnxFilePath = "../resources/onnx/deeper_network.onnx";
-        std::string onnxFilePath = "../resources/onnx/ACASXU_run2a_1_1_batch_2000.onnx";
+        //std::string onnxFilePath = "../resources/onnx/ACASXU_run2a_1_1_batch_2000.onnx";
         //std::string onnxFilePath = "../resources/onnx/mnist-point.onnx";
         //std::string onnxFilePath = "../resources/onnx/sat_v6_c27.onnx";
         //std::string onnxFilePath = "../resources/onnx/layer-zoo/add.onnx";
         //std::string onnxFilePath = "../resources/onnx/toy_add_complex.onnx";
         //std::string onnxFilePath = "../resources/onnx/toy_matmul_add_chain.onnx";
         //std::string onnxFilePath = "../resources/onnx/toy_sub_chain.onnx";
+        //std::string onnxFilePath = "../resources/onnx/toy_conv_model.onnx";
+        std::string onnxFilePath = "../resources/onnx/cifar_base_kw_simp.onnx";
 
 
         
         //std::string vnnlibFilePath = "../resources/properties/deeper_network_test.vnnlib";
-        std::string vnnlibFilePath = "../resources/onnx/vnnlib/prop_1.vnnlib";
+        //std::string vnnlibFilePath = "../resources/onnx/vnnlib/prop_1.vnnlib";
         //std::string vnnlibFilePath = "../resources/onnx/vnnlib/mnist-img10.vnnlib";
         //std::string vnnlibFilePath = "../resources/onnx/vnnlib/sat_v6_c27.vnnlib";
         //std::string vnnlibFilePath = "../resources/onnx/vnnlib/add_input.vnnlib";
+        //std::string vnnlibFilePath = "../resources/onnx/vnnlib/conv_input.vnnlib";
+        std::string vnnlibFilePath = "../resources/onnx/vnnlib/cifar_bounded.vnnlib";
 
 
-        unsigned iterations = 20; 
+        //unsigned iterations = 20; 
 
         std::cout << "Parsing ONNX file: " << onnxFilePath << std::endl;
         std::cout << "Parsing VNN-LIB file: " << vnnlibFilePath << std::endl;
@@ -99,6 +103,7 @@ int main(int argc, char* argv[]) {
                 case NLR::NodeType::FLATTEN: std::cout << "FLATTEN"; break;
                 case NLR::NodeType::SUB: std::cout << "SUB"; break;
                 case NLR::NodeType::ADD: std::cout << "ADD"; break;
+                case NLR::NodeType::CONV: std::cout << "CONV"; break;
                 default: std::cout << "UNKNOWN";
             }
             std::cout << " (in=" << node->getInputSize()
@@ -140,13 +145,18 @@ int main(int argc, char* argv[]) {
             std::cout << "Converted input bounds to float32" << std::endl;
         }
 
-        // Print input bounds with high precision to verify exact values
-        std::cout << std::fixed << std::setprecision(9);
-        for (int i = 0; i < lowerBounds.size(0); ++i) {
-            std::cout << "  X_" << i << ": [" << lowerBounds[i].item<double>()
-                      << ", " << upperBounds[i].item<double>() << "]" << std::endl;
-        }
-        std::cout << std::defaultfloat;
+        // Debug: Print input bounds (commented out to reduce output)
+        // std::cout << std::fixed << std::setprecision(9);
+        // for (int i = 0; i < lowerBounds.size(0); ++i) {
+        //     std::cout << "  X_" << i << ": [" << lowerBounds[i].item<double>()
+        //               << ", " << upperBounds[i].item<double>() << "]" << std::endl;
+        // }
+        // std::cout << std::defaultfloat;
+
+        // Print summary of input bounds instead
+        std::cout << "  Input bounds: " << lowerBounds.size(0) << " variables bounded in ["
+                  << lowerBounds.min().item<double>() << ", "
+                  << upperBounds.max().item<double>() << "]" << std::endl;
 
         // Step 3: Run plain CROWN first
         std::cout << "\nRunning plain CROWN analysis..." << std::endl;
@@ -175,6 +185,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Bounds are undefined" << std::endl;
         }
 
+        /**
         // Step 4: Configure analysis for Alpha-CROWN
         NLR::AnalysisConfig config;
         config.method = NLR::AnalysisConfig::Method::AlphaCROWN;
@@ -207,6 +218,10 @@ int main(int argc, char* argv[]) {
         } else {
             std::cout << "Bounds are undefined" << std::endl;
         }
+        **/
+
+        // Step 4: Skip Alpha-CROWN - only run CROWN
+        std::cout << "\nSkipping Alpha-CROWN analysis - CROWN-only mode" << std::endl;
 
         std::cout << "\nVerification completed successfully!" << std::endl;
         return 0;

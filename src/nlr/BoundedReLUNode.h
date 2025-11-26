@@ -19,10 +19,10 @@ public:
     
     // Backward bound propagation
     void boundBackward(
-        const torch::Tensor& last_lA,
-        const torch::Tensor& last_uA,
+        const BoundA& last_lA,
+        const BoundA& last_uA,
         const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
-        Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+        Vector<Pair<BoundA, BoundA>>& outputA_matrices,
         torch::Tensor& lbias,
         torch::Tensor& ubias
     ) override;
@@ -34,7 +34,7 @@ public:
     // Module information
     unsigned getInputSize() const override;
     unsigned getOutputSize() const override;
-    bool isPerturbed() const override { return false; }
+    bool isPerturbed() const override { return true; }  // ReLU is perturbed (depends on input)
     
     // Size setters for initialization
     void setInputSize(unsigned size) override;
@@ -57,7 +57,7 @@ public:
     };
     
     // Unified backward relaxation method (following auto_LiRPA approach)
-    RelaxationResult _backwardRelaxation(const torch::Tensor& last_lA, const torch::Tensor& last_uA,
+    RelaxationResult _backwardRelaxation(const BoundA& last_lA, const BoundA& last_uA,
                                         const torch::Tensor& input_lower, const torch::Tensor& input_upper);
     
     // Alpha-aware relaxation computation
@@ -79,6 +79,9 @@ private:
     torch::Tensor _computeStandardCROWNLowerBound(const torch::Tensor& input_lower, const torch::Tensor& input_upper);
     torch::Tensor getAlphaForBound(bool isLowerBound, int boundType) const;
     void _maskAlpha(const torch::Tensor& input_lower, const torch::Tensor& input_upper, const torch::Tensor& upper_d, RelaxationResult& result);
+    
+    // Helper to maybe unfold patches
+    torch::Tensor maybe_unfold_patches(const torch::Tensor& d_tensor, const BoundA& last_A);
 
     // Storage for CROWN upper slopes (for alpha initialization)
     torch::Tensor init_upper_d;

@@ -4,6 +4,7 @@
 #include "TorchModel.h"
 #include "BoundedTorchNode.h"
 #include "BoundedTensor.h"
+#include "BoundResult.h"
 #include "Map.h"
 #include "Vector.h"
 #include "Set.h"
@@ -38,8 +39,8 @@ public:
     // Public access methods for testing
     torch::Tensor getIBPLowerBound(unsigned nodeIndex);
     torch::Tensor getIBPUpperBound(unsigned nodeIndex);
-    torch::Tensor getCrownLowerBound(unsigned nodeIndex);
-    torch::Tensor getCrownUpperBound(unsigned nodeIndex);
+    torch::Tensor getCrownLowerBound(unsigned nodeIndex) const;
+    torch::Tensor getCrownUpperBound(unsigned nodeIndex) const;
     bool hasIBPBounds(unsigned nodeIndex);
     bool hasCrownBounds(unsigned nodeIndex);
     unsigned getNumNodes() const;
@@ -96,8 +97,8 @@ public:
     BoundedTensor<torch::Tensor> getNodeConcreteBounds(unsigned nodeIndex) const;
 
     // Helper functions for A matrix accumulation (following auto-LiRPA's approach)
-    torch::Tensor addA(const torch::Tensor& A1, const torch::Tensor& A2);
-    void addBound(unsigned nodeIndex, const torch::Tensor& lA, const torch::Tensor& uA);
+    BoundA addA(const BoundA& A1, const BoundA& A2);
+    void addBound(unsigned nodeIndex, const BoundA& lA, const BoundA& uA);
     void addBias(unsigned nodeIndex, const torch::Tensor& lBias, const torch::Tensor& uBias);
 
     // Backward propagation starting from an arbitrary node (for standard CROWN intermediates)
@@ -131,8 +132,8 @@ private:
     Map<unsigned, std::shared_ptr<BoundedTorchNode>> _nodes;
     
     // A matrix storage following auto-LiRPA's approach
-    Map<unsigned, torch::Tensor> _lA;  // lower bound A matrices
-    Map<unsigned, torch::Tensor> _uA;  // upper bound A matrices
+    Map<unsigned, BoundA> _lA;  // lower bound A matrices
+    Map<unsigned, BoundA> _uA;  // upper bound A matrices
 
     // Bias accumulation following auto-LiRPA's approach
     // The following were global bias accumulation, since we need bounds on every nueron, need the bias for each nodes individual scope
@@ -167,8 +168,11 @@ private:
             case NodeType::LINEAR: return "LINEAR";
             case NodeType::RELU: return "RELU";
             case NodeType::RESHAPE: return "RESHAPE";
+            case NodeType::FLATTEN: return "FLATTEN";
             case NodeType::IDENTITY: return "IDENTITY";
+            case NodeType::ADD: return "ADD";
             case NodeType::SUB: return "SUB";
+            case NodeType::CONV: return "CONV";
             default: return "UNKNOWN";
         }
     }

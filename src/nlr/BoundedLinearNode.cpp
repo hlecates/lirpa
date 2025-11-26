@@ -80,10 +80,10 @@ torch::Tensor BoundedLinearNode::forward(const torch::Tensor& input) {
 }
 
 void BoundedLinearNode::boundBackward(
-    const torch::Tensor& last_lA,
-    const torch::Tensor& last_uA,
+    const BoundA& last_lA,
+    const BoundA& last_uA,
     const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
-    Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+    Vector<Pair<BoundA, BoundA>>& outputA_matrices,
     torch::Tensor& lbias,
     torch::Tensor& ubias) {
 
@@ -91,18 +91,17 @@ void BoundedLinearNode::boundBackward(
         throw std::runtime_error("BoundedLinearNode expects at least one input");
     }
 
+    if (!last_lA.isTensor() || !last_uA.isTensor()) {
+        // Fallback or error for Patches
+        throw std::runtime_error("BoundedLinearNode: Patches mode propagation not implemented (requires conversion to matrix)");
+    }
+
+    torch::Tensor last_lA_tensor = last_lA.asTensor();
+    torch::Tensor last_uA_tensor = last_uA.asTensor();
+
     // Extract weight and bias from the linear module
     auto weight = _linearModule->weight.to(torch::kFloat32);
     auto bias = _linearModule->bias.defined() ? _linearModule->bias.to(torch::kFloat32) : torch::Tensor();
-
-    // DEBUG: Log dtype conversions at first few calls (disabled for clean output)
-    // static int call_count = 0;
-    // if (call_count++ < 5) {
-    //     printf("[DEBUG BoundedLinearNode] Node '%s': Original weight dtype=%s, last_lA dtype=%s, converting to Float32\n",
-    //            _nodeName.ascii(),
-    //            torch::toString(_linearModule->weight.dtype()).c_str(),
-    //            last_lA.defined() ? torch::toString(last_lA.dtype()).c_str() : "undefined");
-    // }
 
     // Scale weight by alpha
     weight = _alpha * weight;
@@ -112,15 +111,15 @@ void BoundedLinearNode::boundBackward(
     // and weight represents the transformation from current layer input to current layer output
     
     // Compute A matrices for linear layer
-    torch::Tensor lA = torch::matmul(last_lA, weight);
-    torch::Tensor uA = torch::matmul(last_uA, weight);
+    torch::Tensor lA = torch::matmul(last_lA_tensor, weight);
+    torch::Tensor uA = torch::matmul(last_uA_tensor, weight);
     
-    outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(lA, uA));
+    outputA_matrices.append(Pair<BoundA, BoundA>(BoundA(lA), BoundA(uA)));
     
     // Compute bias contribution 
     // The key insight: bias terms must be transformed to output space dimensions
     if (bias.defined()) {
-        if (last_lA.defined() && last_lA.numel() > 0) {
+        if (last_lA_tensor.defined() && last_lA_tensor.numel() > 0) {
             // Transform bias using A matrix multiplication
             // For our case: last_lA: [1, final_output_size, current_layer_output_size]
             // bias: [current_layer_output_size]
@@ -133,8 +132,8 @@ void BoundedLinearNode::boundBackward(
             
             // Matrix multiplication: [1, final_output_size, current_layer_output_size] @ [1, current_layer_output_size, 1]
             // This gives us: [1, final_output_size, 1]
-            torch::Tensor transformed_lbias = torch::matmul(last_lA, bias_reshaped).squeeze(-1).squeeze(0); // [final_output_size]
-            torch::Tensor transformed_ubias = torch::matmul(last_uA, bias_reshaped).squeeze(-1).squeeze(0); // [final_output_size]
+            torch::Tensor transformed_lbias = torch::matmul(last_lA_tensor, bias_reshaped).squeeze(-1).squeeze(0); // [final_output_size]
+            torch::Tensor transformed_ubias = torch::matmul(last_uA_tensor, bias_reshaped).squeeze(-1).squeeze(0); // [final_output_size]
             
             lbias = transformed_lbias;
             ubias = transformed_ubias;

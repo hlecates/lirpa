@@ -137,6 +137,10 @@ namespace BoundedOperationConverter {
                                                      const Map<String, torch::Tensor>& constants,
                                                      const Map<String, onnx::ValueInfoProto>& name_to_input,
                                                      const Map<String, onnx::TensorProto>& name_to_initializer);
+    std::shared_ptr<NLR::BoundedTorchNode> convertConv(const onnx::NodeProto& node,
+                                                     const Map<String, torch::Tensor>& constants,
+                                                     const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                                     const Map<String, onnx::TensorProto>& name_to_initializer);
     std::shared_ptr<NLR::BoundedTorchNode> convertConstant(const torch::Tensor& value);
 }
 

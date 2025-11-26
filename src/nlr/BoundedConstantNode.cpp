@@ -13,10 +13,10 @@ torch::Tensor NLR::BoundedConstantNode::forward(const torch::Tensor& input) {
 }
 
 void NLR::BoundedConstantNode::boundBackward(
-    const torch::Tensor& last_lA,
-    const torch::Tensor& last_uA,
+    const BoundA& last_lA,
+    const BoundA& last_uA,
     const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
-    Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+    Vector<Pair<BoundA, BoundA>>& outputA_matrices,
     torch::Tensor& lbias,
     torch::Tensor& ubias
 ) {
@@ -24,12 +24,21 @@ void NLR::BoundedConstantNode::boundBackward(
 
     // Constants add to bias, zero A matrices
     // The bias size should match the spec dimension of the incoming A matrix
+    
+    // If Patches, fallback (throw)
+    if (last_lA.isPatches() || last_uA.isPatches()) {
+        throw std::runtime_error("BoundedConstantNode: Patches mode not implemented (requires conversion)");
+    }
+    
+    torch::Tensor last_lA_tensor = last_lA.asTensor();
+    torch::Tensor last_uA_tensor = last_uA.asTensor();
+
     // Determine spec dimension from A matrices
     int spec_size = 0;
-    if (last_lA.defined()) {
-        spec_size = (last_lA.dim() >= 2) ? last_lA.size(1) : last_lA.size(0);
-    } else if (last_uA.defined()) {
-        spec_size = (last_uA.dim() >= 2) ? last_uA.size(1) : last_uA.size(0);
+    if (last_lA_tensor.defined()) {
+        spec_size = (last_lA_tensor.dim() >= 2) ? last_lA_tensor.size(1) : last_lA_tensor.size(0);
+    } else if (last_uA_tensor.defined()) {
+        spec_size = (last_uA_tensor.dim() >= 2) ? last_uA_tensor.size(1) : last_uA_tensor.size(0);
     }
 
     // Initialize bias tensors if they're not defined
@@ -40,22 +49,22 @@ void NLR::BoundedConstantNode::boundBackward(
         ubias = torch::zeros({spec_size});
     }
 
-    if (last_lA.defined()) {
+    if (last_lA_tensor.defined()) {
         // Compute bias contribution: A @ constant
         // last_lA has shape [batch, spec, *constant_shape]
         // We need to compute matrix multiplication: A @ constant
         // Flatten both A and constant to 2D for proper matrix multiplication
 
         torch::Tensor A_flat;
-        if (last_lA.dim() == 3) {
+        if (last_lA_tensor.dim() == 3) {
             // Shape: [batch, spec, const_size] -> reshape to [batch*spec, const_size]
-            A_flat = last_lA.reshape({last_lA.size(0) * last_lA.size(1), last_lA.size(2)});
-        } else if (last_lA.dim() == 2) {
+            A_flat = last_lA_tensor.reshape({last_lA_tensor.size(0) * last_lA_tensor.size(1), last_lA_tensor.size(2)});
+        } else if (last_lA_tensor.dim() == 2) {
             // Already 2D [spec, const_size]
-            A_flat = last_lA;
+            A_flat = last_lA_tensor;
         } else {
             // Flatten all dimensions except the last
-            A_flat = last_lA.flatten(0, -2);
+            A_flat = last_lA_tensor.flatten(0, -2);
         }
 
         torch::Tensor constant_flat = _constantValue.flatten();
@@ -64,30 +73,30 @@ void NLR::BoundedConstantNode::boundBackward(
         torch::Tensor new_lbias = torch::matmul(A_flat, constant_flat);
 
         // Reshape to [batch, spec] if needed, then squeeze to match bias shape
-        if (last_lA.dim() == 3) {
-            new_lbias = new_lbias.reshape({last_lA.size(0), last_lA.size(1)}).squeeze(0);
+        if (last_lA_tensor.dim() == 3) {
+            new_lbias = new_lbias.reshape({last_lA_tensor.size(0), last_lA_tensor.size(1)}).squeeze(0);
         }
 
         // Add to existing bias
         lbias = lbias + new_lbias;
     }
 
-    if (last_uA.defined()) {
+    if (last_uA_tensor.defined()) {
         // Compute bias contribution: A @ constant
         torch::Tensor A_flat;
-        if (last_uA.dim() == 3) {
-            A_flat = last_uA.reshape({last_uA.size(0) * last_uA.size(1), last_uA.size(2)});
-        } else if (last_uA.dim() == 2) {
-            A_flat = last_uA;
+        if (last_uA_tensor.dim() == 3) {
+            A_flat = last_uA_tensor.reshape({last_uA_tensor.size(0) * last_uA_tensor.size(1), last_uA_tensor.size(2)});
+        } else if (last_uA_tensor.dim() == 2) {
+            A_flat = last_uA_tensor;
         } else {
-            A_flat = last_uA.flatten(0, -2);
+            A_flat = last_uA_tensor.flatten(0, -2);
         }
 
         torch::Tensor constant_flat = _constantValue.flatten();
         torch::Tensor new_ubias = torch::matmul(A_flat, constant_flat);
 
-        if (last_uA.dim() == 3) {
-            new_ubias = new_ubias.reshape({last_uA.size(0), last_uA.size(1)}).squeeze(0);
+        if (last_uA_tensor.dim() == 3) {
+            new_ubias = new_ubias.reshape({last_uA_tensor.size(0), last_uA_tensor.size(1)}).squeeze(0);
         }
 
         ubias = ubias + new_ubias;

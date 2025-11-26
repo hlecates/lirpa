@@ -179,6 +179,7 @@ set(BIN_DIR "${CMAKE_BINARY_DIR}/bin")
 
 # Collect source files
 file(GLOB SRCS_NLR "${NLR_DIR}/*.cpp")
+file(GLOB SRCS_NLR_CONV "${NLR_DIR}/conv/*.cpp")
 file(GLOB SRCS_INPUT_PARSERS "${INPUT_PARSERS_DIR}/*.cpp")
 file(GLOB SRCS_COMMON "${COMMON_DIR}/*.cpp")
 file(GLOB SRCS_COMMON_REAL "${COMMON_DIR}/real/*.cpp")
@@ -190,6 +191,7 @@ set(SRCS_CONFIG "${SRC_DIR}/configuration/GlobalConfiguration.cpp")
 add_library(${LIRPA_LIB}
     ${DEPS_ONNX}
     ${SRCS_NLR}
+    ${SRCS_NLR_CONV}
     ${SRCS_INPUT_PARSERS}
     ${SRCS_COMMON}
     ${SRCS_COMMON_REAL}

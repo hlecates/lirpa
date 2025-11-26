@@ -388,7 +388,8 @@ torch::Tensor TorchModel::forward(unsigned nodeIndex, Map<unsigned, torch::Tenso
         case NodeType::FLATTEN:
         case NodeType::IDENTITY:
         case NodeType::SUB:
-        case NodeType::ADD: {
+        case NodeType::ADD:
+        case NodeType::CONV: {
             // Module nodes need to compute their inputs first
             if ( !_dependencies.exists(nodeIndex) ) 
             {

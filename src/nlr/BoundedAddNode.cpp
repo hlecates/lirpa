@@ -36,10 +36,10 @@ torch::Tensor BoundedAddNode::broadcast_backward(const torch::Tensor& last_A, co
 }
 
 void BoundedAddNode::boundBackward(
-    const torch::Tensor& last_lA,
-    const torch::Tensor& last_uA,
+    const BoundA& last_lA,
+    const BoundA& last_uA,
     const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
-    Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+    Vector<Pair<BoundA, BoundA>>& outputA_matrices,
     torch::Tensor& lbias,
     torch::Tensor& ubias) {
 
@@ -52,29 +52,36 @@ void BoundedAddNode::boundBackward(
     if (inputBounds.size() == 1) {
         // Single input case (x + constant)
         // The gradient w.r.t. x is 1, so we just pass through the A matrices
-        outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(last_lA, last_uA));
+        outputA_matrices.append(Pair<BoundA, BoundA>(last_lA, last_uA));
 
         // Add contribution from constant to bias if we have one
         if (_constantValue.defined()) {
+            if (last_lA.isPatches() || last_uA.isPatches()) {
+                throw std::runtime_error("BoundedAddNode: Patches mode with constant bias not implemented (requires conversion)");
+            }
+
+            torch::Tensor lA_tensor = last_lA.asTensor();
+            torch::Tensor uA_tensor = last_uA.asTensor();
+
             // For x + c, we need to compute A @ c where A is the backward propagation matrix
             // This properly accounts for the linear transformation in the backward pass
-            if (last_lA.defined()) {
+            if (lA_tensor.defined()) {
                 torch::Tensor constant = _constantValue.flatten();
 
                 // Compute A @ constant to get the bias contribution
                 // last_lA has shape (batch, spec, features) or (spec, features)
                 // constant has shape (features,)
                 torch::Tensor constant_contrib;
-                if (last_lA.dim() == 3) {
+                if (lA_tensor.dim() == 3) {
                     // Shape: (batch, spec, features) @ (features,) -> (batch, spec)
-                    constant_contrib = torch::matmul(last_lA, constant.unsqueeze(-1)).squeeze(-1);
+                    constant_contrib = torch::matmul(lA_tensor, constant.unsqueeze(-1)).squeeze(-1);
                     // Flatten to (spec,) if batch dimension is 1
                     if (constant_contrib.size(0) == 1) {
                         constant_contrib = constant_contrib.squeeze(0);
                     }
-                } else if (last_lA.dim() == 2) {
+                } else if (lA_tensor.dim() == 2) {
                     // Shape: (spec, features) @ (features,) -> (spec,)
-                    constant_contrib = torch::matmul(last_lA, constant);
+                    constant_contrib = torch::matmul(lA_tensor, constant);
                 } else {
                     throw std::runtime_error("BoundedAddNode::boundBackward: unexpected last_lA dimensions");
                 }
@@ -86,21 +93,21 @@ void BoundedAddNode::boundBackward(
                 }
             }
 
-            if (last_uA.defined()) {
+            if (uA_tensor.defined()) {
                 torch::Tensor constant = _constantValue.flatten();
 
                 // Compute A @ constant for upper bound
                 torch::Tensor constant_contrib;
-                if (last_uA.dim() == 3) {
+                if (uA_tensor.dim() == 3) {
                     // Shape: (batch, spec, features) @ (features,) -> (batch, spec)
-                    constant_contrib = torch::matmul(last_uA, constant.unsqueeze(-1)).squeeze(-1);
+                    constant_contrib = torch::matmul(uA_tensor, constant.unsqueeze(-1)).squeeze(-1);
                     // Flatten to (spec,) if batch dimension is 1
                     if (constant_contrib.size(0) == 1) {
                         constant_contrib = constant_contrib.squeeze(0);
                     }
-                } else if (last_uA.dim() == 2) {
+                } else if (uA_tensor.dim() == 2) {
                     // Shape: (spec, features) @ (features,) -> (spec,)
-                    constant_contrib = torch::matmul(last_uA, constant);
+                    constant_contrib = torch::matmul(uA_tensor, constant);
                 } else {
                     throw std::runtime_error("BoundedAddNode::boundBackward: unexpected last_uA dimensions");
                 }
@@ -115,8 +122,8 @@ void BoundedAddNode::boundBackward(
     } else if (inputBounds.size() == 2) {
         // Two input case (x + y)
         // Both inputs get the same A matrices since derivatives are 1
-        outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(last_lA, last_uA));
-        outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(last_lA, last_uA));
+        outputA_matrices.append(Pair<BoundA, BoundA>(last_lA, last_uA));
+        outputA_matrices.append(Pair<BoundA, BoundA>(last_lA, last_uA));
     } else {
         throw std::runtime_error("BoundedAddNode::boundBackward expects 1 or 2 input bounds");
     }

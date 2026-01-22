@@ -33,7 +33,6 @@
 #include "../engine/nodes/BoundedConvNode.h"
 #include "../engine/nodes/BoundedConvTransposeNode.h"
 #include "../engine/nodes/BoundedConcatNode.h"
-#include "../engine/nodes/BoundedSliceNode.h"
 #include "../engine/LirpaError.h"
 #include "File.h"
 #include "MString.h"
@@ -465,108 +464,7 @@ std::shared_ptr<NLR::TorchModel> OnnxToTorchParser::processGraph() {
                     if (node.input_size() > 0 && shape_metadata.exists(node.input(0))) {
                         output_shape = shape_metadata[node.input(0)];
                     }
-                } else if (node.op_type() == "Slice") {
-                    // Slice operation - compute exact output shape
-                    if (node.input_size() > 0 && shape_metadata.exists(node.input(0))) {
-                        Vector<int> input_shape = shape_metadata[node.input(0)];
-                        output_shape = input_shape; // Start with input shape
-                        
-                        // Parse slice parameters
-                        // ONNX Slice opset >= 10: inputs are (data, starts, ends, axes?, steps?)
-                        // ONNX Slice opset < 10: attributes are (starts, ends, axes?)
-                        
-                        Vector<int64_t> starts, ends, axes, steps;
-                        
-                        // Try to get parameters from inputs (opset >= 10)
-                        if (node.input_size() >= 3) {
-                            // Get starts
-                            String starts_name = node.input(1);
-                            if (name_to_initializer.exists(starts_name)) {
-                                torch::Tensor starts_tensor = ConstantProcessor::processInitializer(name_to_initializer[starts_name]);
-                                for (int64_t i = 0; i < starts_tensor.numel(); ++i) {
-                                    starts.append(starts_tensor.flatten()[i].item<int64_t>());
-                                }
-                            }
-                            
-                            // Get ends
-                            String ends_name = node.input(2);
-                            if (name_to_initializer.exists(ends_name)) {
-                                torch::Tensor ends_tensor = ConstantProcessor::processInitializer(name_to_initializer[ends_name]);
-                                for (int64_t i = 0; i < ends_tensor.numel(); ++i) {
-                                    ends.append(ends_tensor.flatten()[i].item<int64_t>());
-                                }
-                            }
-                            
-                            // Get axes (optional)
-                            if (node.input_size() >= 4 && !node.input(3).empty()) {
-                                String axes_name = node.input(3);
-                                if (name_to_initializer.exists(axes_name)) {
-                                    torch::Tensor axes_tensor = ConstantProcessor::processInitializer(name_to_initializer[axes_name]);
-                                    for (int64_t i = 0; i < axes_tensor.numel(); ++i) {
-                                        axes.append(axes_tensor.flatten()[i].item<int64_t>());
-                                    }
-                                }
-                            }
-                            
-                            // Get steps (optional)
-                            if (node.input_size() >= 5 && !node.input(4).empty()) {
-                                String steps_name = node.input(4);
-                                if (name_to_initializer.exists(steps_name)) {
-                                    torch::Tensor steps_tensor = ConstantProcessor::processInitializer(name_to_initializer[steps_name]);
-                                    for (int64_t i = 0; i < steps_tensor.numel(); ++i) {
-                                        steps.append(steps_tensor.flatten()[i].item<int64_t>());
-                                    }
-                                }
-                            }
-                        }
-                        
-                        // If axes not specified, default to [0, 1, 2, ..., len(starts)-1]
-                        if (axes.empty() && !starts.empty()) {
-                            for (size_t i = 0; i < starts.size(); ++i) {
-                                axes.append(i);
-                            }
-                        }
-                        
-                        // If steps not specified, default to [1, 1, ...]
-                        if (steps.empty() && !starts.empty()) {
-                            for (size_t i = 0; i < starts.size(); ++i) {
-                                steps.append(1);
-                            }
-                        }
-                        
-                        // Compute output shape for each sliced axis
-                        for (size_t i = 0; i < axes.size() && i < starts.size() && i < ends.size(); ++i) {
-                            int axis = axes[i];
-                            if (axis < 0) axis += input_shape.size(); // Handle negative axes
-                            
-                            if (axis >= 0 && axis < (int)input_shape.size()) {
-                                int64_t start = starts[i];
-                                int64_t end = ends[i];
-                                int64_t step = i < steps.size() ? steps[i] : 1;
-                                int64_t dim_size = input_shape[axis];
-                                
-                                // Handle negative indices
-                                if (start < 0) start += dim_size;
-                                if (end < 0) end += dim_size;
-                                
-                                // Clamp to valid range
-                                start = std::max(int64_t(0), std::min(start, dim_size));
-                                end = std::max(int64_t(0), std::min(end, dim_size));
-                                
-                                // Compute sliced dimension size
-                                int64_t sliced_size = 0;
-                                if (step > 0 && end > start) {
-                                    sliced_size = (end - start + step - 1) / step;
-                                } else if (step < 0 && start > end) {
-                                    sliced_size = (start - end - step - 1) / (-step);
-                                }
-                                
-                                output_shape[axis] = std::max(int64_t(0), sliced_size);
-                            }
-                        }
-                    }
                 }
-                
                 if (!output_shape.empty()) {
                     shape_metadata[outputName] = output_shape;
                     shapes_added++;
@@ -859,11 +757,6 @@ std::shared_ptr<NLR::TorchModel> OnnxToTorchParser::processGraph() {
                     }
                 } else if (node.op_type() == "BatchNormalization") {
                     boundedNode = BoundedOperationConverter::convertBatchNormalization(node, constantsMap, name_to_input, name_to_initializer);
-                } else if (node.op_type() == "Slice") {
-                    boundedNode = BoundedOperationConverter::convertSlice(node, name_to_input, name_to_initializer, shape_metadata);
-                    if (!boundedNode) {
-                        onnxToTorchBoundedModuleCreationError("Slice", "Conversion returned nullptr");
-                    }
                 } else if (node.op_type() == "Gather") {
                     // TODO: Implement proper BoundedGatherNode with correct bound propagation
                     // For now, treat as Identity (conservative but sound)
@@ -1005,9 +898,8 @@ std::shared_ptr<NLR::TorchModel> OnnxToTorchParser::processGraph() {
                             node->setInputSize(inferredSize);
                             // Output size was set in convertConcat, don't override it
                         } else {
-                            // For dimension-preserving nodes (RELU, IDENTITY/SLICE, RESHAPE, etc.)
+                            // For dimension-preserving nodes (RELU, IDENTITY, RESHAPE, etc.)
                             node->setInputSize(inferredSize);
-                            // For IDENTITY nodes that might be Slice, preserve output size if already set
                             if (node->getOutputSize() == 0) {
                                 node->setOutputSize(inferredSize);
                             }
@@ -2625,175 +2517,6 @@ namespace BoundedOperationConverter {
                 boundedNode->setOutputSize(computedOutputSize);
             }
         }
-        return boundedNode;
-    }
-
-    std::shared_ptr<NLR::BoundedTorchNode> convertSlice(const onnx::NodeProto& node,
-                                                         const Map<String, onnx::ValueInfoProto>& name_to_input,
-                                                         const Map<String, onnx::TensorProto>& name_to_initializer,
-                                                         const Map<String, Vector<int>>& shape_metadata) {
-        // ONNX Slice can have parameters as attributes or as inputs
-        // Opset < 10: uses attributes (starts, ends, axes)
-        // Opset >= 10: uses inputs (data, starts, ends, axes, steps)
-        
-        int start = 0, end = INT32_MAX, axis = 0, step = 1;
-        
-        // Try to get from attributes first (older ONNX versions)
-        bool has_attributes = false;
-        for (const auto& attr : node.attribute()) {
-            if (attr.name() == "starts" && attr.ints_size() > 0) {
-                start = attr.ints(0);
-                has_attributes = true;
-            } else if (attr.name() == "ends" && attr.ints_size() > 0) {
-                end = attr.ints(0);
-                has_attributes = true;
-            } else if (attr.name() == "axes" && attr.ints_size() > 0) {
-                axis = attr.ints(0);
-                has_attributes = true;
-            }
-        }
-        
-        // If not in attributes, try to get from constant inputs (newer ONNX versions)
-        if (!has_attributes && node.input_size() >= 3) {
-            // Input format: [data, starts, ends, axes?, steps?]
-            
-            // Get starts
-            if (node.input_size() > 1) {
-                String startsName = node.input(1);
-                if (name_to_initializer.exists(startsName)) {
-                    const auto& tensor = name_to_initializer[startsName];
-                    if (tensor.data_type() == onnx::TensorProto::INT64) {
-                        if (tensor.int64_data_size() > 0) {
-                            start = tensor.int64_data(0);
-                        } else if (tensor.raw_data().size() >= 8) {
-                            // Extract from raw_data
-                            const char* raw = tensor.raw_data().data();
-                            start = *reinterpret_cast<const int64_t*>(raw);
-                        }
-                    } else if (tensor.data_type() == onnx::TensorProto::INT32) {
-                        if (tensor.int32_data_size() > 0) {
-                            start = tensor.int32_data(0);
-                        } else if (tensor.raw_data().size() >= 4) {
-                            const char* raw = tensor.raw_data().data();
-                            start = *reinterpret_cast<const int32_t*>(raw);
-                        }
-                    }
-                }
-            }
-            
-            // Get ends
-            if (node.input_size() > 2) {
-                String endsName = node.input(2);
-                if (name_to_initializer.exists(endsName)) {
-                    const auto& tensor = name_to_initializer[endsName];
-                    if (tensor.data_type() == onnx::TensorProto::INT64) {
-                        if (tensor.int64_data_size() > 0) {
-                            end = tensor.int64_data(0);
-                        } else if (tensor.raw_data().size() >= 8) {
-                            const char* raw = tensor.raw_data().data();
-                            end = *reinterpret_cast<const int64_t*>(raw);
-                        }
-                    } else if (tensor.data_type() == onnx::TensorProto::INT32) {
-                        if (tensor.int32_data_size() > 0) {
-                            end = tensor.int32_data(0);
-                        } else if (tensor.raw_data().size() >= 4) {
-                            const char* raw = tensor.raw_data().data();
-                            end = *reinterpret_cast<const int32_t*>(raw);
-                        }
-                    }
-                }
-            }
-            
-            // Get axes (optional)
-            if (node.input_size() > 3) {
-                String axesName = node.input(3);
-                if (name_to_initializer.exists(axesName)) {
-                    const auto& tensor = name_to_initializer[axesName];
-                    if (tensor.data_type() == onnx::TensorProto::INT64) {
-                        if (tensor.int64_data_size() > 0) {
-                            axis = tensor.int64_data(0);
-                        } else if (tensor.raw_data().size() >= 8) {
-                            const char* raw = tensor.raw_data().data();
-                            axis = *reinterpret_cast<const int64_t*>(raw);
-                        }
-                    } else if (tensor.data_type() == onnx::TensorProto::INT32) {
-                        if (tensor.int32_data_size() > 0) {
-                            axis = tensor.int32_data(0);
-                        } else if (tensor.raw_data().size() >= 4) {
-                            const char* raw = tensor.raw_data().data();
-                            axis = *reinterpret_cast<const int32_t*>(raw);
-                        }
-                    }
-                }
-            }
-            
-            // Get steps (optional)
-            if (node.input_size() > 4) {
-                String stepsName = node.input(4);
-                if (name_to_initializer.exists(stepsName)) {
-                    const auto& tensor = name_to_initializer[stepsName];
-                    if (tensor.data_type() == onnx::TensorProto::INT64) {
-                        if (tensor.int64_data_size() > 0) {
-                            step = tensor.int64_data(0);
-                        } else if (tensor.raw_data().size() >= 8) {
-                            const char* raw = tensor.raw_data().data();
-                            step = *reinterpret_cast<const int64_t*>(raw);
-                        }
-                    } else if (tensor.data_type() == onnx::TensorProto::INT32) {
-                        if (tensor.int32_data_size() > 0) {
-                            step = tensor.int32_data(0);
-                        } else if (tensor.raw_data().size() >= 4) {
-                            const char* raw = tensor.raw_data().data();
-                            step = *reinterpret_cast<const int32_t*>(raw);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Create Slice node
-        auto boundedNode = std::make_shared<NLR::BoundedSliceNode>(start, end, axis, step);
-        
-        // Try to infer input shape and sizes
-        if (node.input_size() > 0) {
-            String inputName = node.input(0);
-            
-            // Try to get shape from shape_metadata first (for intermediate tensors)
-            TensorShape inputShape;
-            if (shape_metadata.exists(inputName)) {
-                const Vector<int>& shape_vec = shape_metadata[inputName];
-                for (unsigned j = 0; j < shape_vec.size(); ++j) {
-                    inputShape.append(static_cast<unsigned>(shape_vec[j]));
-                }
-            } else {
-                inputShape = extractShapeFromNode(node, name_to_input, name_to_initializer, inputName);
-            }
-            
-            if (!inputShape.empty()) {
-                // Store input shape for backward pass
-                std::vector<int64_t> shape_vec;
-                for (unsigned s : inputShape) {
-                    shape_vec.push_back(s);
-                }
-                boundedNode->setInputShape(shape_vec);
-                
-                // Set input size
-                unsigned inputSize = computeTensorSize(inputShape);
-                boundedNode->setInputSize(inputSize);
-                
-                // Compute output size (slice reduces size along one axis)
-                if (axis >= 0 && axis < (int)inputShape.size()) {
-                    int actual_start = start < 0 ? start + inputShape[axis] : start;
-                    int actual_end = end < 0 ? end + inputShape[axis] : end;
-                    actual_end = std::min(actual_end, (int)inputShape[axis]);
-                    int slice_length = std::max(0, actual_end - actual_start);
-                    
-                    unsigned outputSize = inputSize / inputShape[axis] * slice_length;
-                    boundedNode->setOutputSize(outputSize);
-                }
-            }
-        }
-        
         return boundedNode;
     }
 

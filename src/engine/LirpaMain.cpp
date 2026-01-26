@@ -250,7 +250,7 @@ int lirpaMain(int argc, char* argv[]) {
         }
 
         BoundedTensor<torch::Tensor> inputBounds = torchModel->getInputBounds();
-        
+
         if (LirpaConfiguration::VERBOSE) {
             std::cout << "\nInput bounds loaded from VNN-LIB file" << std::endl;
             torch::Tensor lowerBounds = inputBounds.lower();
@@ -263,14 +263,14 @@ int lirpaMain(int argc, char* argv[]) {
         // Step 3: Check if specification matrix was loaded from VNN-LIB file
         torch::Tensor* specMatrix = nullptr;
         torch::Tensor C;  // Keep C in wider scope so pointer remains valid
-        
+
         if (torchModel->hasSpecificationMatrix()) {
             // Get the specification matrix that was automatically parsed from VNN-LIB
             C = torchModel->getSpecificationMatrix();
             specMatrix = &C;
-            
+
             if (LirpaConfiguration::VERBOSE) {
-                std::cout << "\nUsing specification matrix from VNN-LIB file with " 
+                std::cout << "\nUsing specification matrix from VNN-LIB file with "
                           << C.size(0) << " constraints" << std::endl;
             }
         } else {
@@ -281,7 +281,7 @@ int lirpaMain(int argc, char* argv[]) {
 
         // Step 4: Run analysis based on configured method
         BoundedTensor<torch::Tensor> result;
-        
+
         if (LirpaConfiguration::ANALYSIS_METHOD == LirpaConfiguration::AnalysisMethod::AlphaCROWN) {
             if (LirpaConfiguration::VERBOSE) {
                 std::cout << "\nRunning Alpha-CROWN analysis..." << std::endl;

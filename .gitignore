@@ -54,6 +54,8 @@ _deps/
 /tools/pybind11-*/
 /tools/pybind11*.tar.gz
 
+run_linearize_benchmarks.py
+
 # ============================================================================
 # IDE and Editor files
 # ============================================================================
@@ -100,7 +102,9 @@ wheelhouse/
 .mypy_cache/
 .pytest_cache/
 *.ipynb_checkpoints/
-*-checkpoint.ipynb
+*-checkpoint.ipynbnt
+
+.venv
 
 # ============================================================================
 # Logs and temporary files

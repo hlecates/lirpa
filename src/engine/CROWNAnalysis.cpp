@@ -147,7 +147,13 @@ void CROWNAnalysis::run(bool enableGradients)
         _foundFirstUnsound = false;
         _firstUnsoundNode = 0;
 
-        if (LirpaConfiguration::USE_STANDARD_CROWN) {
+        // IMPORTANT: When gradients are enabled (Alpha-CROWN), use simple CROWN mode (single backward pass)
+        // to avoid in-place modification conflicts during multiple backward passes.
+        // The standard CROWN mode with multiple backward passes causes issues with PyTorch's autograd
+        // when the same alpha tensors are accessed from different computation graphs.
+        bool useStandardCrown = LirpaConfiguration::USE_STANDARD_CROWN && !enableGradients;
+        
+        if (useStandardCrown) {
             // Standard CROWN: Selective backward passes for ReLU layers
 
             // First, compute IBP bounds as reference (used for linear/conv layers)
@@ -667,6 +673,17 @@ void CROWNAnalysis::backwardFrom(unsigned startIndex, const Vector<unsigned>& un
                             }
                         }
                         
+                        // If 0D (scalar), expand to [spec, batch] format
+                        if (bias.dim() == 0) {
+                            if (A_spec > 0 && A_batch > 0) {
+                                // Scalar -> expand to [spec, batch]
+                                return bias.unsqueeze(0).unsqueeze(0).expand({A_spec, A_batch});
+                            } else {
+                                // No A context, expand to [1, 1]
+                                return bias.unsqueeze(0).unsqueeze(0);
+                            }
+                        }
+                        
                         // If 1D, need to determine if it's [spec] or [batch]
                         if (bias.dim() == 1) {
                             if (A_spec > 0 && A_batch > 0) {
@@ -947,7 +964,6 @@ void CROWNAnalysis::concretizeNode(unsigned startIndex, const Vector<unsigned>& 
     torch::Tensor concreteLower, concreteUpper;
     computeConcreteBounds(lA, uA, lBias, uBias, inputLower, inputUpper, concreteLower, concreteUpper);
 
-
     log(Stringf("concretizeNode() - Computed concrete bounds: lower.defined()=%d, upper.defined()=%d",
         concreteLower.defined(), concreteUpper.defined()));
 
@@ -976,9 +992,9 @@ void CROWNAnalysis::concretizeNode(unsigned startIndex, const Vector<unsigned>& 
                     
                     // Scatter/Put - use non-in-place index_put to avoid breaking computation graph
                     // We want fullLowerFlat[indices] = concreteLower
-                    // Ensure concreteLower is flat and detach if part of computation graph
-                    torch::Tensor concreteLowerFlat = concreteLower.flatten().detach();
-                    torch::Tensor concreteUpperFlat = concreteUpper.flatten().detach();
+                    // NOTE: Do NOT detach - we need to preserve gradients for Alpha-CROWN
+                    torch::Tensor concreteLowerFlat = concreteLower.flatten();
+                    torch::Tensor concreteUpperFlat = concreteUpper.flatten();
                     
                     // Use index_put (non-in-place) instead of index_put_ to avoid breaking gradients
                     // index_put returns a new tensor, so we need to assign it back

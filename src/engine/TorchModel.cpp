@@ -465,7 +465,8 @@ torch::Tensor TorchModel::forward(unsigned nodeIndex, Map<unsigned, torch::Tenso
         case NodeType::BATCHNORM:
         case NodeType::SIGMOID:
         case NodeType::CONCAT:
-        case NodeType::CONVTRANSPOSE: {
+        case NodeType::CONVTRANSPOSE:
+        case NodeType::SLICE: {
             // Module nodes need to compute their inputs first
             if ( !_dependencies.exists(nodeIndex) ) 
             {

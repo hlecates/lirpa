@@ -198,10 +198,12 @@ torch::Tensor BoundedConvNode::forward(const torch::Tensor& input) {
     // Convert input to float32 and ensure contiguous
     torch::Tensor inputFloat = input.to(torch::kFloat32).contiguous();
 
-    // Update input/output shapes
-    input_shape.clear();
-    for (int i = 0; i < input.dim(); ++i) {
-        input_shape.push_back(input.size(i));
+    // Update input/output shapes only if not already set from ONNX metadata
+    // (ONNX parsing sets the proper 4D shape, forward() might receive flattened input)
+    if (input_shape.empty()) {
+        for (int i = 0; i < input.dim(); ++i) {
+            input_shape.push_back(input.size(i));
+        }
     }
 
     torch::Tensor output;
@@ -342,23 +344,78 @@ void BoundedConvNode::boundBackward(
             torch::Tensor weight = conv2d->weight;
             int64_t in_channels_per_group = weight.size(1);
             int64_t in_channels = in_channels_per_group * groups;
+            int64_t kernel_h = weight.size(2);
+            int64_t kernel_w = weight.size(3);
             
             // Assume [Batch, C, H, W]
-            int64_t spatial_dim_sq = total_input_size / in_channels; // H * W
-            int64_t H = static_cast<int64_t>(std::sqrt(spatial_dim_sq));
-            int64_t W = H;
+            int64_t spatial_size = total_input_size / in_channels; // H * W
             
-            if (in_channels * H * W != total_input_size) {
+            // Find a valid factorization H * W = spatial_size where H >= kernel_h and W >= kernel_w
+            int64_t H = 0, W = 0;
+            
+            // First try square layout
+            int64_t sqrt_spatial = static_cast<int64_t>(std::sqrt(spatial_size));
+            if (sqrt_spatial * sqrt_spatial == spatial_size && 
+                sqrt_spatial >= kernel_h && sqrt_spatial >= kernel_w) {
+                H = sqrt_spatial;
+                W = sqrt_spatial;
+            } else {
+                // Find a valid non-square factorization
+                // Prefer factorizations closer to square that satisfy kernel constraints
+                int64_t best_H = 0, best_W = 0;
+                int64_t best_diff = INT64_MAX;
+                
+                for (int64_t h = 1; h * h <= spatial_size; ++h) {
+                    if (spatial_size % h == 0) {
+                        int64_t w = spatial_size / h;
+                        // Check both orientations: (h, w) and (w, h)
+                        if (h >= kernel_h && w >= kernel_w) {
+                            int64_t diff = std::abs(h - w);
+                            if (diff < best_diff) {
+                                best_diff = diff;
+                                best_H = h;
+                                best_W = w;
+                            }
+                        }
+                        if (w >= kernel_h && h >= kernel_w) {
+                            int64_t diff = std::abs(h - w);
+                            if (diff < best_diff) {
+                                best_diff = diff;
+                                best_H = w;
+                                best_W = h;
+                            }
+                        }
+                    }
+                }
+                
+                if (best_H > 0) {
+                    H = best_H;
+                    W = best_W;
+                } else {
+                    // No valid factorization found - use 1D-like layout
+                    // Try [1, spatial_size] or [spatial_size, 1]
+                    if (spatial_size >= kernel_w && 1 >= kernel_h) {
+                        H = 1;
+                        W = spatial_size;
+                    } else if (spatial_size >= kernel_h && 1 >= kernel_w) {
+                        H = spatial_size;
+                        W = 1;
+                    } else {
+                        // Last resort: use closest square and let the convolution potentially fail
+                        H = sqrt_spatial > 0 ? sqrt_spatial : 1;
+                        W = spatial_size / H;
+                    }
+                }
             }
             
             input_shape = {1, static_cast<int>(in_channels), static_cast<int>(H), static_cast<int>(W)};
             
             // Also compute output shape
-             std::vector<int> kernel_size = {static_cast<int>(weight.size(2)),
-                                           static_cast<int>(weight.size(3))};
+             std::vector<int> kernel_size_vec = {static_cast<int>(kernel_h),
+                                          static_cast<int>(kernel_w)};
             std::vector<int> spatial_output = MatrixConvolution::computeConvOutputShape(
                 {static_cast<int>(H), static_cast<int>(W)},
-                kernel_size, stride, padding, dilation
+                kernel_size_vec, stride, padding, dilation
             );
             
             output_shape = {1, static_cast<int>(weight.size(0)), spatial_output[0], spatial_output[1]};
@@ -893,31 +950,41 @@ BoundedTensor<torch::Tensor> BoundedConvNode::computeIntervalBoundPropagation(
             // For other common sizes, compute H and W
             else if (total_elements % in_channels == 0) {
                 int spatial_size = total_elements / in_channels;
-                int H = static_cast<int>(std::sqrt(spatial_size));
-                int W = H;  // Try square input first
+                int kernel_h = weight.size(2);
+                int kernel_w = weight.size(3);
+                int sqrt_spatial = static_cast<int>(std::sqrt(spatial_size));
 
-                if (H * W == spatial_size) {
-                    // Perfect square - use as is
-                    input_lower = input_lower.reshape({in_channels, H, W});
-                    input_upper = input_upper.reshape({in_channels, H, W});
+                // Check if perfect square AND satisfies kernel constraints
+                if (sqrt_spatial * sqrt_spatial == spatial_size && 
+                    sqrt_spatial >= kernel_h && sqrt_spatial >= kernel_w) {
+                    // Perfect square that works with kernel - use as is
+                    input_lower = input_lower.reshape({in_channels, sqrt_spatial, sqrt_spatial});
+                    input_upper = input_upper.reshape({in_channels, sqrt_spatial, sqrt_spatial});
                 } else {
-                    // Not a perfect square - try to find a valid spatial layout
-                    int kernel_h = weight.size(2);
-                    int kernel_w = weight.size(3);
-                    
+                    // Need to find a valid spatial layout that satisfies kernel constraints
                     // Try to factorize spatial_size into H*W that satisfies H >= kernel_h and W >= kernel_w
                     int best_H = 0, best_W = 0;
+                    int best_diff = INT32_MAX;
                     
                     // Try factorizations of spatial_size
-                    for (int H = 1; H * H <= spatial_size; ++H) {
-                        if (spatial_size % H == 0) {
-                            int W = spatial_size / H;
-                            // Check if this factorization is compatible with kernel
-                            if (H >= kernel_h && W >= kernel_w) {
-                                // Prefer factorizations closer to square
-                                if (best_H == 0 || std::abs(H - W) < std::abs(best_H - best_W)) {
-                                    best_H = H;
-                                    best_W = W;
+                    for (int h = 1; h * h <= spatial_size; ++h) {
+                        if (spatial_size % h == 0) {
+                            int w = spatial_size / h;
+                            // Check both orientations: (h, w) and (w, h)
+                            if (h >= kernel_h && w >= kernel_w) {
+                                int diff = std::abs(h - w);
+                                if (diff < best_diff) {
+                                    best_diff = diff;
+                                    best_H = h;
+                                    best_W = w;
+                                }
+                            }
+                            if (w >= kernel_h && h >= kernel_w) {
+                                int diff = std::abs(h - w);
+                                if (diff < best_diff) {
+                                    best_diff = diff;
+                                    best_H = w;
+                                    best_W = h;
                                 }
                             }
                         }

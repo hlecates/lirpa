@@ -159,6 +159,7 @@ namespace BoundedOperationConverter {
                                                      const Map<String, onnx::TensorProto>& name_to_initializer,
                                                      const Map<String, Vector<int>>& shape_metadata);
     std::shared_ptr<NLR::BoundedTorchNode> convertSlice(const onnx::NodeProto& node,
+                                                        const Map<String, torch::Tensor>& constants,
                                                         const Map<String, onnx::ValueInfoProto>& name_to_input,
                                                         const Map<String, onnx::TensorProto>& name_to_initializer,
                                                         const Map<String, Vector<int>>& shape_metadata);

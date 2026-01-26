@@ -44,7 +44,7 @@ public:
     // Module information
     unsigned getInputSize() const override;
     unsigned getOutputSize() const override;
-    bool isPerturbed() const override { return false; }
+    bool isPerturbed() const override { return true; }  // Identity passes through input perturbations
     
     // Size setters for initialization
     void setInputSize(unsigned size) override;

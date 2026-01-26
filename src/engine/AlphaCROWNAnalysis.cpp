@@ -279,10 +279,9 @@ AlphaParameters& AlphaCROWNAnalysis::ensureAlphaFor(
     }
 
     if (need_new) {
-        // Create alpha tensor WITHOUT gradients first
+        // Create alpha tensor WITH its own storage to avoid any shared storage issues
         // Shape: [specDim, 1, outDim] (no leading "2" dimension)
         auto options = input_lb.options().dtype(torch::kFloat32);
-        torch::Tensor alpha = torch::zeros({specDim, 1, outDim}, options);
 
         // Initialize alpha based on bound side
         torch::Tensor slope_init;
@@ -308,12 +307,17 @@ AlphaParameters& AlphaCROWNAnalysis::ensureAlphaFor(
             }
         }
 
-        // Broadcast slope to [spec, 1, out]
-        auto alpha_init = slope_init.view({1, 1, outDim}).expand({specDim, 1, outDim});
-        alpha.copy_(alpha_init);
-
-        // NOW enable gradients after initialization
-        alpha = alpha.detach().requires_grad_(true);
+        // CRITICAL FIX: Use contiguous().clone() to ensure completely independent storage
+        // The expand() operation creates a view that shares storage, and detach() also shares storage.
+        // By using clone() after expand(), we get a tensor with its own independent storage.
+        // This prevents in-place modification errors when the autograd graph is built.
+        // NOTE: Use set_requires_grad(true) instead of requires_grad_(true) to avoid in-place modification
+        torch::Tensor alpha = slope_init.view({1, 1, outDim})
+                                        .expand({specDim, 1, outDim})
+                                        .contiguous()  // Materialize the expanded view
+                                        .clone()       // Create independent storage
+                                        .to(options.dtype());
+        alpha.set_requires_grad(true);  // Non-in-place way to enable gradients
 
         AlphaParameters params;
         params.alpha = alpha;
@@ -1366,7 +1370,10 @@ torch::Tensor AlphaCROWNAnalysis::getAlphaForNodeAllSpecs(
     auto& ap = ensureAlphaFor(nodeIndex, startKey, specDim, outDim, input_lb, input_ub);
 
     // ap.alpha: [spec, 1, out] -> drop batch dimension
-    return ap.alpha.select(/*dim=*/1, /*batch=*/0); // [spec, out]
+    // IMPORTANT: Return a squeezed view rather than select() to maintain gradient connection
+    // The squeeze operation creates a tensor that can still track gradients back to ap.alpha
+    // Use squeeze(1) instead of select(1,0) to avoid creating a strided view
+    return ap.alpha.squeeze(1); // [spec, out]
 }
 
 torch::Tensor AlphaCROWNAnalysis::getAllAlphaParameters() const

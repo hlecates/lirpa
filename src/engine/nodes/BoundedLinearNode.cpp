@@ -325,12 +325,16 @@ void BoundedLinearNode::setOutputSize(unsigned size) {
 
 // IBP computation methods
 torch::Tensor BoundedLinearNode::computeLinearIBPLowerBound(const torch::Tensor& inputLowerBound, const torch::Tensor& inputUpperBound) {
-    auto weight = _linearModule->weight.to(torch::kFloat32);
+    const auto device = inputLowerBound.device();
+    auto weight = _linearModule->weight
+        .to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
     weight = _alpha * weight;
     
     // Convert input tensors to float32 if needed
-    torch::Tensor inputLower = inputLowerBound.to(torch::kFloat32);
-    torch::Tensor inputUpper = inputUpperBound.to(torch::kFloat32);
+    torch::Tensor inputLower = inputLowerBound
+        .to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    torch::Tensor inputUpper = inputUpperBound
+        .to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
     
     // For linear layers, IBP is straightforward
     // y_lower = W_positive * x_lower + W_negative * x_upper
@@ -349,12 +353,16 @@ torch::Tensor BoundedLinearNode::computeLinearIBPLowerBound(const torch::Tensor&
 }
 
 torch::Tensor BoundedLinearNode::computeLinearIBPUpperBound(const torch::Tensor& inputLowerBound, const torch::Tensor& inputUpperBound) {
-    auto weight = _linearModule->weight.to(torch::kFloat32);
+    const auto device = inputLowerBound.device();
+    auto weight = _linearModule->weight
+        .to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
     weight = _alpha * weight;
     
     // Convert input tensors to float32 if needed
-    torch::Tensor inputLower = inputLowerBound.to(torch::kFloat32);
-    torch::Tensor inputUpper = inputUpperBound.to(torch::kFloat32);
+    torch::Tensor inputLower = inputLowerBound
+        .to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    torch::Tensor inputUpper = inputUpperBound
+        .to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
     
     // For linear layers, IBP is straightforward
     // y_upper = W_positive * x_upper + W_negative * x_lower

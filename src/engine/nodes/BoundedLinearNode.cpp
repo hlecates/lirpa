@@ -68,9 +68,12 @@ torch::Tensor BoundedLinearNode::forward(const torch::Tensor& input) {
         _output_size = _linearModule->weight.size(0);
     }
     
-    // Convert input and weight to float32 for consistency
-    torch::Tensor inputFloat = input.to(torch::kFloat32).contiguous();
-    torch::Tensor weight = _linearModule->weight.to(torch::kFloat32).contiguous();
+    // Convert input and parameters to float32 on the input device for consistency
+    const auto device = input.device();
+    torch::Tensor inputFloat = input.to(torch::TensorOptions().dtype(torch::kFloat32).device(device)).contiguous();
+    torch::Tensor weight = _linearModule->weight
+        .to(torch::TensorOptions().dtype(torch::kFloat32).device(device))
+        .contiguous();
 
     // Apply linear transformation: y = alpha * (W * x + b)
     torch::Tensor weight_t = weight.t().contiguous();
@@ -80,7 +83,8 @@ torch::Tensor BoundedLinearNode::forward(const torch::Tensor& input) {
     // Add bias if defined
     torch::Tensor result = alpha_scaled;
     if (_linearModule->bias.defined()) {
-        torch::Tensor bias = _linearModule->bias.to(torch::kFloat32);
+        torch::Tensor bias = _linearModule->bias
+            .to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
         result = result + bias;
     }
     
@@ -244,6 +248,7 @@ BoundedTensor<torch::Tensor> BoundedLinearNode::computeIntervalBoundPropagation(
     const auto& inputBoundsPair = inputBounds[0];
     torch::Tensor inputLowerBound = inputBoundsPair.lower().to(torch::kFloat32);
     torch::Tensor inputUpperBound = inputBoundsPair.upper().to(torch::kFloat32);
+    const auto device = inputLowerBound.device();
     
     // Set input size from input bounds if not already set
     if (_input_size == 0 && inputLowerBound.defined()) {
@@ -251,8 +256,11 @@ BoundedTensor<torch::Tensor> BoundedLinearNode::computeIntervalBoundPropagation(
     }
     
     // Extract weight and bias
-    auto weight = _linearModule->weight.to(torch::kFloat32);
-    auto bias = _linearModule->bias.defined() ? _linearModule->bias.to(torch::kFloat32) : torch::Tensor();
+    auto weight = _linearModule->weight
+        .to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    auto bias = _linearModule->bias.defined()
+        ? _linearModule->bias.to(torch::TensorOptions().dtype(torch::kFloat32).device(device))
+        : torch::Tensor();
     
     // Scale weight by alpha
     weight = _alpha * weight;

@@ -152,6 +152,44 @@ TorchModel::TorchModel(const String& onnxPath,
                 CMatrixResult cMatrixResult = outputConstraints.toCMatrix();
                 torch::Tensor C = cMatrixResult.C;
 
+                // DEBUG: Print specification matrix details
+                if (LirpaConfiguration::VERBOSE) {
+                    printf("[DEBUG TorchModel] Specification matrix created:\n");
+                    printf("  Shape: [%lld, %lld, %lld]\n", 
+                           (long long)C.size(0), (long long)C.size(1), (long long)C.size(2));
+                    printf("  Number of constraints: %lld\n", (long long)C.size(0));
+                    printf("  Output dimension: %lld\n", (long long)C.size(2));
+                    if (C.numel() <= 50) {
+                        printf("  Full matrix:\n");
+                        for (int i = 0; i < C.size(0); ++i) {
+                            printf("    Constraint %d: [", i);
+                            for (int j = 0; j < C.size(2); ++j) {
+                                if (j > 0) printf(", ");
+                                printf("%.3f", C[i][0][j].item<float>());
+                            }
+                            printf("]\n");
+                        }
+                    } else {
+                        printf("  First constraint: [");
+                        for (int j = 0; j < std::min(10, (int)C.size(2)); ++j) {
+                            if (j > 0) printf(", ");
+                            printf("%.3f", C[0][0][j].item<float>());
+                        }
+                        if (C.size(2) > 10) printf(", ...");
+                        printf("]\n");
+                    }
+                    if (cMatrixResult.thresholds.defined()) {
+                        printf("  Thresholds: [");
+                        auto thresh_flat = cMatrixResult.thresholds.flatten();
+                        for (int i = 0; i < std::min(10, (int)thresh_flat.numel()); ++i) {
+                            if (i > 0) printf(", ");
+                            printf("%.6f", thresh_flat[i].item<float>());
+                        }
+                        if (thresh_flat.numel() > 10) printf(", ...");
+                        printf("]\n");
+                    }
+                }
+
                 // Store the specification matrix in the model
                 setSpecificationMatrix(C);
 

@@ -449,11 +449,48 @@ void CROWNAnalysis::backwardFrom(unsigned startIndex, const Vector<unsigned>& un
         // Query TorchModel for specification matrix - preprocess it (using output node for correct sizing)
         torch::Tensor specMatrix = _torchModel->getSpecificationMatrix();
         
+        // DEBUG: Print specification matrix before preprocessing
+        if (LirpaConfiguration::VERBOSE) {
+            printf("[DEBUG] Specification matrix (raw) shape: [");
+            for (int i = 0; i < specMatrix.dim(); ++i) {
+                if (i > 0) printf(", ");
+                printf("%lld", (long long)specMatrix.size(i));
+            }
+            printf("]\n");
+            if (specMatrix.numel() <= 20) {
+                printf("[DEBUG] Specification matrix values:\n");
+                auto flat = specMatrix.flatten();
+                for (int i = 0; i < flat.numel(); ++i) {
+                    printf("  [%d] = %.6f\n", i, flat[i].item<float>());
+                }
+            } else {
+                printf("[DEBUG] Specification matrix (first 10 values): ");
+                auto flat = specMatrix.flatten();
+                for (int i = 0; i < std::min(10, (int)flat.numel()); ++i) {
+                    printf("%.3f ", flat[i].item<float>());
+                }
+                printf("\n");
+            }
+        }
+        
         initMatrix = preprocessC(specMatrix, outputIndex);
         numSpecs = initMatrix.size(0);
         
         log(Stringf("backwardFrom() - Using specification matrix from TorchModel (preprocessed), shape [%ld, %ld, %ld]",
                     initMatrix.size(0), initMatrix.size(1), initMatrix.size(2)));
+        
+        // DEBUG: Print preprocessed matrix
+        if (LirpaConfiguration::VERBOSE) {
+            printf("[DEBUG] Preprocessed initMatrix shape: [%lld, %lld, %lld]\n",
+                   (long long)initMatrix.size(0), (long long)initMatrix.size(1), (long long)initMatrix.size(2));
+            if (initMatrix.numel() <= 20) {
+                printf("[DEBUG] Preprocessed initMatrix values:\n");
+                auto flat = initMatrix.flatten();
+                for (int i = 0; i < flat.numel(); ++i) {
+                    printf("  [%d] = %.6f\n", i, flat[i].item<float>());
+                }
+            }
+        }
     } else {
         // For intermediate nodes or when no C matrix: use identity matrix
         // Identity matrix size matches the start node's output size
@@ -919,6 +956,84 @@ void CROWNAnalysis::concretizeNode(unsigned startIndex, const Vector<unsigned>& 
     BoundA lA_bound = _lA.exists(inputIndex) ? _lA[inputIndex] : BoundA();
     BoundA uA_bound = _uA.exists(inputIndex) ? _uA[inputIndex] : BoundA();
     
+    // DEBUG: Print A matrix statistics at input node for output node
+    if (LirpaConfiguration::VERBOSE && startIndex == getOutputIndex() && lA_bound.isTensor()) {
+        torch::Tensor lA_tensor = lA_bound.asTensor();
+        printf("[DEBUG concretizeNode] A matrix at input node %d for output node %u:\n", inputIndex, startIndex);
+        printf("  lA shape: [");
+        for (int i = 0; i < lA_tensor.dim(); ++i) {
+            if (i > 0) printf(", ");
+            printf("%lld", (long long)lA_tensor.size(i));
+        }
+        printf("]\n");
+        if (lA_tensor.numel() <= 30) {
+            printf("  lA values:\n");
+            auto flat = lA_tensor.flatten();
+            for (int i = 0; i < flat.numel(); ++i) {
+                printf("    [%d] = %.6f\n", i, flat[i].item<float>());
+            }
+        } else {
+            printf("  lA (first 10): ");
+            auto flat = lA_tensor.flatten();
+            for (int i = 0; i < std::min(10, (int)flat.numel()); ++i) {
+                printf("%.3f ", flat[i].item<float>());
+            }
+            printf("\n  lA stats: min=%.6f, max=%.6f, mean=%.6f, norm=%.6f\n",
+                   lA_tensor.min().item<float>(), lA_tensor.max().item<float>(),
+                   lA_tensor.mean().item<float>(), lA_tensor.norm().item<float>());
+        }
+        if (_lowerBias.exists(inputIndex)) {
+            torch::Tensor bias = _lowerBias[inputIndex];
+            printf("  lBias shape: [");
+            for (int i = 0; i < bias.dim(); ++i) {
+                if (i > 0) printf(", ");
+                printf("%lld", (long long)bias.size(i));
+            }
+            printf("], values=[");
+            auto bias_flat = bias.flatten();
+            for (int i = 0; i < std::min(10, (int)bias_flat.numel()); ++i) {
+                if (i > 0) printf(", ");
+                printf("%.6f", bias_flat[i].item<float>());
+            }
+            if (bias_flat.numel() > 10) printf(", ...");
+            printf("]\n");
+        }
+        
+        // Also print uA and uBias for upper bound debugging
+        if (uA_bound.isTensor()) {
+            torch::Tensor uA_tensor = uA_bound.asTensor();
+            printf("  uA shape: [");
+            for (int i = 0; i < uA_tensor.dim(); ++i) {
+                if (i > 0) printf(", ");
+                printf("%lld", (long long)uA_tensor.size(i));
+            }
+            printf("]\n");
+            if (uA_tensor.numel() <= 30) {
+                printf("  uA values:\n");
+                auto flat = uA_tensor.flatten();
+                for (int i = 0; i < flat.numel(); ++i) {
+                    printf("    [%d] = %.6f\n", i, flat[i].item<float>());
+                }
+            }
+            if (_upperBias.exists(inputIndex)) {
+                torch::Tensor bias = _upperBias[inputIndex];
+                printf("  uBias shape: [");
+                for (int i = 0; i < bias.dim(); ++i) {
+                    if (i > 0) printf(", ");
+                    printf("%lld", (long long)bias.size(i));
+                }
+                printf("], values=[");
+                auto bias_flat = bias.flatten();
+                for (int i = 0; i < std::min(10, (int)bias_flat.numel()); ++i) {
+                    if (i > 0) printf(", ");
+                    printf("%.6f", bias_flat[i].item<float>());
+                }
+                if (bias_flat.numel() > 10) printf(", ...");
+                printf("]\n");
+            }
+        }
+    }
+    
     torch::Tensor lA, uA;
     
     if (lA_bound.isPatches()) {
@@ -966,6 +1081,40 @@ void CROWNAnalysis::concretizeNode(unsigned startIndex, const Vector<unsigned>& 
 
     log(Stringf("concretizeNode() - Computed concrete bounds: lower.defined()=%d, upper.defined()=%d",
         concreteLower.defined(), concreteUpper.defined()));
+    
+    // DEBUG: Print concrete bounds and A matrix info
+    if (LirpaConfiguration::VERBOSE && concreteLower.defined() && concreteUpper.defined()) {
+        printf("[DEBUG concretizeNode] Node %u concrete bounds:\n", startIndex);
+        printf("  Lower: shape=[%lld], values=[", (long long)concreteLower.numel());
+        auto lower_flat = concreteLower.flatten();
+        for (int i = 0; i < std::min(10, (int)lower_flat.numel()); ++i) {
+            if (i > 0) printf(", ");
+            printf("%.6f", lower_flat[i].item<float>());
+        }
+        if (lower_flat.numel() > 10) printf(", ...");
+        printf("]\n");
+        printf("  Upper: shape=[%lld], values=[", (long long)concreteUpper.numel());
+        auto upper_flat = concreteUpper.flatten();
+        for (int i = 0; i < std::min(10, (int)upper_flat.numel()); ++i) {
+            if (i > 0) printf(", ");
+            printf("%.6f", upper_flat[i].item<float>());
+        }
+        if (upper_flat.numel() > 10) printf(", ...");
+        printf("]\n");
+        if (lower_flat.numel() == upper_flat.numel()) {
+            torch::Tensor widths = upper_flat - lower_flat;
+            printf("  Widths: mean=%.6f, min=%.6f, max=%.6f\n",
+                   widths.mean().item<float>(), widths.min().item<float>(), widths.max().item<float>());
+        }
+        if (lA.defined() && lA.dim() >= 2) {
+            printf("  lA shape: [");
+            for (int i = 0; i < lA.dim(); ++i) {
+                if (i > 0) printf(", ");
+                printf("%lld", (long long)lA.size(i));
+            }
+            printf("]\n");
+        }
+    }
 
     if (concreteLower.defined() && concreteUpper.defined()) {
         
@@ -1144,6 +1293,7 @@ void CROWNAnalysis::concretizeBounds()
 
 Vector<BoundedTensor<torch::Tensor>> CROWNAnalysis::getInputBoundsForNode(unsigned nodeIndex) {
     Vector<BoundedTensor<torch::Tensor>> inputBounds;
+    const torch::Device device = _torchModel->getDevice();
     
     if (_torchModel->getDependenciesMap().exists(nodeIndex) && !_torchModel->getDependencies(nodeIndex).empty()) {
         
@@ -1178,10 +1328,16 @@ Vector<BoundedTensor<torch::Tensor>> CROWNAnalysis::getInputBoundsForNode(unsign
                     lower = _ibpBounds[inputIndex].lower();
                     upper = _ibpBounds[inputIndex].upper();
                 } else {
-                    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(_torchModel->getDevice());
+                    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
                     lower = torch::zeros({(long)outputSize}, options);
                     upper = torch::ones({(long)outputSize}, options);
                 }
+            }
+            if (lower.defined() && lower.device() != device) {
+                lower = lower.to(device);
+            }
+            if (upper.defined() && upper.device() != device) {
+                upper = upper.to(device);
             }
             inputBounds.append(BoundedTensor<torch::Tensor>(lower, upper));
         }
@@ -1317,9 +1473,22 @@ torch::Tensor CROWNAnalysis::computeConcreteLowerBound(
     }
     torch::Tensor term = Apos.bmm(xL) + Aneg.bmm(xU);            // (1,spec,1)
     torch::Tensor out  = term + bL;                              // (1,spec,1)
-    
+
+    // DEBUG: Print detailed bound computation info
+    if (LirpaConfiguration::VERBOSE) {
+        printf("[DEBUG computeConcreteLowerBound]\n");
+        printf("  AL shape: [%lld, %lld, %lld]\n", (long long)AL.size(0), (long long)AL.size(1), (long long)AL.size(2));
+        printf("  xL range: [%.6f, %.6f]\n", xL.min().item<float>(), xL.max().item<float>());
+        printf("  xU range: [%.6f, %.6f]\n", xU.min().item<float>(), xU.max().item<float>());
+        printf("  AL range: [%.6f, %.6f], sum=%.6f\n", AL.min().item<float>(), AL.max().item<float>(), AL.sum().item<float>());
+        printf("  Apos sum: %.6f, Aneg sum: %.6f\n", Apos.sum().item<float>(), Aneg.sum().item<float>());
+        printf("  bL range: [%.6f, %.6f]\n", bL.min().item<float>(), bL.max().item<float>());
+        printf("  term (Apos@xL + Aneg@xU): [%.6f, %.6f]\n", term.min().item<float>(), term.max().item<float>());
+        printf("  out (term + bL): [%.6f, %.6f]\n", out.min().item<float>(), out.max().item<float>());
+    }
+
     torch::Tensor result = out.squeeze(-1).squeeze(0);           // (spec,)
-    
+
     return result;
 }
 
@@ -1342,9 +1511,20 @@ torch::Tensor CROWNAnalysis::computeConcreteUpperBound(
     // UB = βU + Apos * xU + Aneg * xL
     torch::Tensor term = Apos.bmm(xU) + Aneg.bmm(xL);            // (1,spec,1)
     torch::Tensor out  = term + bU;                              // (1,spec,1)
-    
+
+    // DEBUG: Print detailed bound computation info
+    if (LirpaConfiguration::VERBOSE) {
+        printf("[DEBUG computeConcreteUpperBound]\n");
+        printf("  AU shape: [%lld, %lld, %lld]\n", (long long)AU.size(0), (long long)AU.size(1), (long long)AU.size(2));
+        printf("  AU range: [%.6f, %.6f], sum=%.6f\n", AU.min().item<float>(), AU.max().item<float>(), AU.sum().item<float>());
+        printf("  Apos sum: %.6f, Aneg sum: %.6f\n", Apos.sum().item<float>(), Aneg.sum().item<float>());
+        printf("  bU range: [%.6f, %.6f]\n", bU.min().item<float>(), bU.max().item<float>());
+        printf("  term (Apos@xU + Aneg@xL): [%.6f, %.6f]\n", term.min().item<float>(), term.max().item<float>());
+        printf("  out (term + bU): [%.6f, %.6f]\n", out.min().item<float>(), out.max().item<float>());
+    }
+
     torch::Tensor result = out.squeeze(-1).squeeze(0);           // (spec,)
-    
+
     return result;
 }
 
@@ -1669,7 +1849,11 @@ bool CROWNAnalysis::hasConcreteBounds(unsigned nodeIndex)
 
 void CROWNAnalysis::setFixedConcreteBounds(unsigned nodeIndex, const torch::Tensor& lower, const torch::Tensor& upper)
 {
-    _fixedConcreteBounds[nodeIndex] = std::make_pair(lower.detach().clone(), upper.detach().clone());
+    const torch::Device device = _torchModel->getDevice();
+    torch::Tensor lowerOnDevice = lower.defined() ? lower.to(device) : lower;
+    torch::Tensor upperOnDevice = upper.defined() ? upper.to(device) : upper;
+    _fixedConcreteBounds[nodeIndex] = std::make_pair(lowerOnDevice.detach().clone(),
+                                                     upperOnDevice.detach().clone());
 }
 
 void CROWNAnalysis::clearFixedConcreteBounds()
@@ -1682,7 +1866,44 @@ BoundedTensor<torch::Tensor> CROWNAnalysis::getOutputBounds() const
 {
     unsigned outputIndex = getOutputIndex();
     if (_concreteBounds.exists(outputIndex)) {
-        return _concreteBounds[outputIndex];
+        auto bounds = _concreteBounds[outputIndex];
+        
+        // DEBUG: Print output bounds being returned
+        if (LirpaConfiguration::VERBOSE && bounds.lower().defined() && bounds.upper().defined()) {
+            printf("[DEBUG getOutputBounds] Returning bounds for output node %u:\n", outputIndex);
+            printf("  Lower: shape=[%lld], ", (long long)bounds.lower().numel());
+            auto lower_flat = bounds.lower().flatten();
+            if (lower_flat.numel() <= 10) {
+                printf("values=[");
+                for (int i = 0; i < lower_flat.numel(); ++i) {
+                    if (i > 0) printf(", ");
+                    printf("%.6f", lower_flat[i].item<float>());
+                }
+                printf("]\n");
+            } else {
+                printf("first=%.6f, last=%.6f\n", lower_flat[0].item<float>(), lower_flat[-1].item<float>());
+            }
+            printf("  Upper: shape=[%lld], ", (long long)bounds.upper().numel());
+            auto upper_flat = bounds.upper().flatten();
+            if (upper_flat.numel() <= 10) {
+                printf("values=[");
+                for (int i = 0; i < upper_flat.numel(); ++i) {
+                    if (i > 0) printf(", ");
+                    printf("%.6f", upper_flat[i].item<float>());
+                }
+                printf("]\n");
+            } else {
+                printf("first=%.6f, last=%.6f\n", upper_flat[0].item<float>(), upper_flat[-1].item<float>());
+            }
+            if (lower_flat.numel() == upper_flat.numel()) {
+                torch::Tensor widths = upper_flat - lower_flat;
+                printf("  Width: mean=%.6f, min=%.6f, max=%.6f\n",
+                       widths.mean().item<float>(), widths.min().item<float>(), widths.max().item<float>());
+            }
+            printf("  Has specification matrix: %s\n", _torchModel->hasSpecificationMatrix() ? "yes" : "no");
+        }
+        
+        return bounds;
     }
     return BoundedTensor<torch::Tensor>(torch::Tensor(), torch::Tensor());
 }

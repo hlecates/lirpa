@@ -464,8 +464,10 @@ void BoundedSigmoidNode::boundBackward(
         if (!A.defined() || !A.isTensor()) return 1;
         torch::Tensor t = A.asTensor();
         if (!t.defined()) return 1;
-        if (t.dim() >= 3) return (int)t.size(1);
-        if (t.dim() == 2) return (int)t.size(0);
+        // FIXED: A matrix conventions - spec dim is ALWAYS the first dimension (size(0))
+        // - 3D A: [S, B, ...] => spec dim is size(0)
+        // - 2D A: [S, ...]    => spec dim is size(0)
+        if (t.dim() >= 2) return (int)t.size(0);
         return 1;
     };
     if (last_lA.defined() && last_lA.isTensor()) {

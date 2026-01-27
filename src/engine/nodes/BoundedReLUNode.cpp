@@ -63,11 +63,12 @@ void BoundedReLUNode::boundBackward(
         if (!A.defined() || !A.isTensor()) return 1;
         torch::Tensor t = A.asTensor();
         if (!t.defined()) return 1;
-        // Conventions in this codebase:
-        // - 3D A: [B, S, ...] => spec dim is 1
-        // - 2D A: [S, ...]    => spec dim is 0
-        // - 5D A: [B, S, C, H, W] => spec dim is 1
-        if (t.dim() >= 3) return (int)t.size(1);
+        // A matrix conventions in this codebase:
+        // - 3D A: [S, B, ...] => spec dim is size(0), batch dim is size(1)
+        // - 2D A: [S, ...]    => spec dim is size(0)
+        // For alpha-CROWN, the spec dimension from the output backward pass is what matters
+        // When A shape is [S, 1, neurons], S is the number of specs we optimize for
+        if (t.dim() >= 3) return (int)t.size(0);
         if (t.dim() == 2) return (int)t.size(0);
         return 1;
     };
@@ -78,6 +79,21 @@ void BoundedReLUNode::boundBackward(
     }
     _currentSpecDim = specDim;  // Store for use in _maskAlpha
 
+    // DEBUG: Print spec dimension
+    if (LirpaConfiguration::VERBOSE) {
+        printf("[DEBUG BoundedReLUNode::backward] node=%u, specDim=%d", getNodeIndex(), specDim);
+        if (last_lA.defined() && last_lA.isTensor()) {
+            auto t = last_lA.asTensor();
+            printf(", lA.dim=%d, lA.shape=[", (int)t.dim());
+            for (int i = 0; i < t.dim(); ++i) {
+                if (i > 0) printf(",");
+                printf("%lld", (long long)t.size(i));
+            }
+            printf("]");
+        }
+        printf("\n");
+    }
+
     // Call the unified backward relaxation method
     auto relaxation_result = _backwardRelaxation(last_lA, last_uA, input_lower, input_upper);
     
@@ -87,10 +103,22 @@ void BoundedReLUNode::boundBackward(
 
         // Want v to broadcast to A.
         // Typical shapes:
-        // - v: [flat] and A: [B, S, flat]
-        // - v: [C,H,W] and A: [B, S, C, H, W]
-        // - v: [flat] but A is conv-shaped [B, S, C, H, W] (flat == C*H*W)
+        // - v: [flat] and A: [spec, batch, flat] -> v needs [1, 1, flat]
+        // - v: [C,H,W] and A: [spec, batch, C, H, W] -> v needs [1, 1, C, H, W]
+        // - v: [flat] but A is conv-shaped [spec, batch, C, H, W] (flat == C*H*W)
+        // - v: [spec, flat] and A: [spec, batch, flat] -> v needs [spec, 1, flat] (per-spec alpha!)
         //
+        // Handle per-spec alpha case first: v=[spec, out], A=[spec, batch, out]
+        if (v.dim() == 2 && A.dim() == 3 && v.size(0) == A.size(0)) {
+            // Per-spec slopes: [spec, out] -> [spec, 1, out]
+            v = v.unsqueeze(1);
+            try {
+                return v.expand_as(A);
+            } catch (...) {
+                return v;
+            }
+        }
+
         // Handle the common "flat-to-conv" mismatch by reshaping v when its numel matches
         // the product of A's payload dims.
         if (v.numel() > 0 && A.dim() >= 3) {
@@ -490,11 +518,30 @@ void BoundedReLUNode::_maskAlpha(const torch::Tensor& input_lower, const torch::
     auto unstable = (input_lower < 0) & (input_upper > 0);
 
     // For alpha optimization - alpha is the optimizable slope
+    // IMPORTANT: Only apply alpha for the OUTPUT backward pass (when computing final bounds)
+    // Intermediate backward passes (for ReLU pre-activation bounds) should use standard CROWN
     if (isAlphaOptimizationEnabled() && _alphaCrownAnalysis && _currentSpecDim > 0) {
         // Fetch alpha with LIVE spec dimensions from last_lA
         auto* crown = _alphaCrownAnalysis->getCROWNAnalysis();
         std::string startKey = crown->currentStartKey();
         if (startKey.empty()) startKey = "default";
+
+        // Only apply alpha optimization for output node backward pass
+        // Check if this is the output node by comparing startKey with output index
+        unsigned outputIndex = crown->getOutputIndex();
+        std::string outputKey = "/" + std::to_string(outputIndex);
+
+        if (LirpaConfiguration::VERBOSE) {
+            printf("[DEBUG _maskAlpha] node=%u, startKey=%s, outputKey=%s, match=%s\n",
+                   getNodeIndex(), startKey.c_str(), outputKey.c_str(),
+                   (startKey == outputKey) ? "YES (apply alpha)" : "NO (skip alpha)");
+        }
+
+        if (startKey != outputKey) {
+            // This is an intermediate backward pass - skip alpha optimization
+            // Fall through to standard CROWN relaxation below
+            goto skip_alpha;
+        }
 
         // Get the actual output dimension from input_lower
         // input_lower can be either [neurons] or [batch, neurons] or higher dimensional
@@ -513,6 +560,16 @@ void BoundedReLUNode::_maskAlpha(const torch::Tensor& input_lower, const torch::
             getNodeIndex(), /*isLower=*/true,
             startKey, specDim, outDim,
             input_lower, input_upper); // Returns [spec, out]
+
+        if (LirpaConfiguration::VERBOSE && alpha_tensor.defined()) {
+            printf("[DEBUG _maskAlpha] node=%u, alpha_tensor shape=[%lld,%lld], mean=%.4f, min=%.4f, max=%.4f\n",
+                   getNodeIndex(),
+                   alpha_tensor.dim() >= 1 ? (long long)alpha_tensor.size(0) : 0,
+                   alpha_tensor.dim() >= 2 ? (long long)alpha_tensor.size(1) : 0,
+                   alpha_tensor.mean().item<float>(),
+                   alpha_tensor.min().item<float>(),
+                   alpha_tensor.max().item<float>());
+        }
 
         if (alpha_tensor.defined() && alpha_tensor.numel() > 0) {
             // Clamp alpha to [0,1], keep per-spec
@@ -546,6 +603,7 @@ void BoundedReLUNode::_maskAlpha(const torch::Tensor& input_lower, const torch::
         }
     }
 
+skip_alpha:
     // Apply upper bound slopes (secant line for unstable neurons)
     if (!isAlphaOptimizationEnabled() || !_alphaCrownAnalysis) {
         result.d_upper = torch::where(unstable, upper_d, result.d_upper);

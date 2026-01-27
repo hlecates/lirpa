@@ -317,6 +317,11 @@ AlphaParameters& AlphaCROWNAnalysis::ensureAlphaFor(
                                         .contiguous()  // Materialize the expanded view
                                         .clone()       // Create independent storage
                                         .to(options.dtype());
+        
+        // Ensure alpha is in valid range [0, 1] before enabling gradients
+        // This is important for unstable neurons where alpha should be between 0 and 1
+        alpha = torch::clamp(alpha, 0.0f, 1.0f);
+        
         alpha.set_requires_grad(true);  // Non-in-place way to enable gradients
 
         AlphaParameters params;
@@ -367,8 +372,53 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LirpaConfiguration::Bou
     _crownAnalysis->resetProcessingState();
     _crownAnalysis->run(true); // Enable gradients for Alpha-CROWN
 
+    // Extract initial CROWN bounds (before optimization) for comparison
+    torch::Tensor initialLower = extractLowerBoundsFromCROWN();
+    torch::Tensor initialUpper = extractUpperBoundsFromCROWN();
+    torch::Tensor initialBound = isLower ? initialLower : initialUpper;
+    
+    // Compute initial bound width (mean of upper - lower)
+    float initial_width = 0.0f;
+    if (initialLower.defined() && initialUpper.defined() && initialLower.numel() > 0) {
+        torch::Tensor width_tensor = initialUpper - initialLower;
+        initial_width = width_tensor.mean().item<float>();
+    }
+    
+    log(Stringf("computeOptimizedBounds() - Initial CROWN %s bound width: %.6f (mean across %lld outputs)",
+                isLower ? "LOWER" : "UPPER", initial_width, 
+                initialBound.defined() ? (long long)initialBound.numel() : 0));
+    if (initialBound.defined() && initialBound.numel() > 0) {
+        log(Stringf("computeOptimizedBounds() - Initial bound range: [%.6f, %.6f]",
+                    initialBound.min().item<float>(), initialBound.max().item<float>()));
+    }
+
     // Create optimizer for this bound side
     auto alphaParams = collectAlphaParameters(isLower);
+    
+    // Log alpha parameter statistics
+    if (!alphaParams.empty()) {
+        int total_alpha_params = 0;
+        for (const auto& param : alphaParams) {
+            total_alpha_params += param.numel();
+        }
+        log(Stringf("computeOptimizedBounds() - Found %zu alpha parameter tensors with %d total parameters",
+                    alphaParams.size(), total_alpha_params));
+        
+        // Log alpha statistics from storage map
+        auto& storageMap = isLower ? _alphaByNodeStartLower : _alphaByNodeStartUpper;
+        for (auto& [nodeIdx, perStart] : storageMap) {
+            for (auto& [startKey, ap] : perStart) {
+                if (ap.alpha.defined()) {
+                    log(Stringf("computeOptimizedBounds() - Node %u [%s]: alpha shape=[%lld,%lld,%lld], "
+                                "min=%.6f, max=%.6f, mean=%.6f, requires_grad=%d",
+                                nodeIdx, startKey.c_str(),
+                                (long long)ap.alpha.size(0), (long long)ap.alpha.size(1), (long long)ap.alpha.size(2),
+                                ap.alpha.min().item<float>(), ap.alpha.max().item<float>(), 
+                                ap.alpha.mean().item<float>(), ap.alpha.requires_grad()));
+                }
+            }
+        }
+    }
 
     // DEBUG: Print initial alpha values and dtypes (disabled for clean output)
     // if (!alphaParams.empty()) {
@@ -405,6 +455,7 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LirpaConfiguration::Bou
 
     // Track best bounds
     torch::Tensor bestBounds;
+    float best_width = initial_width;
     float currentLR = _learningRate;
     
     // Early stopping parameters
@@ -433,6 +484,29 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LirpaConfiguration::Bou
         torch::Tensor currentLower = extractLowerBoundsFromCROWN();
         torch::Tensor currentUpper = extractUpperBoundsFromCROWN();
         torch::Tensor currentBound = isLower ? currentLower : currentUpper;
+        
+        // Compute current bound width (mean of upper - lower)
+        float current_width = 0.0f;
+        if (currentLower.defined() && currentUpper.defined() && currentLower.numel() > 0) {
+            torch::Tensor width_tensor = currentUpper - currentLower;
+            current_width = width_tensor.mean().item<float>();
+        }
+        
+        // Compute improvement percentage
+        float improvement_pct = 0.0f;
+        if (initial_width > 0) {
+            if (isLower) {
+                // For lower bounds, we want higher values (tighter bounds)
+                // Improvement = (current - initial) / initial * 100
+                improvement_pct = ((currentBound.mean().item<float>() - initialBound.mean().item<float>()) / 
+                                   std::abs(initialBound.mean().item<float>())) * 100.0f;
+            } else {
+                // For upper bounds, we want lower values (tighter bounds)
+                // Improvement = (initial - current) / initial * 100
+                improvement_pct = ((initialBound.mean().item<float>() - currentBound.mean().item<float>()) / 
+                                   std::abs(initialBound.mean().item<float>())) * 100.0f;
+            }
+        }
 
         // Compute loss for all iterations to include in summary
         // NOTE: Loss must be computed with tensors that have gradient tracking enabled
@@ -442,6 +516,13 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LirpaConfiguration::Bou
             // Ensure bounds still have gradients attached for loss computation
             loss = computeLoss(currentLower, currentUpper, isLower);
         }
+        
+        // Log iteration statistics
+        log(Stringf("computeOptimizedBounds() - Iter %u: bound_width=%.6f (initial=%.6f, improvement=%.2f%%), "
+                    "bound_range=[%.6f, %.6f]",
+                    iter + 1, current_width, initial_width, improvement_pct,
+                    currentBound.defined() && currentBound.numel() > 0 ? currentBound.min().item<float>() : 0.0f,
+                    currentBound.defined() && currentBound.numel() > 0 ? currentBound.max().item<float>() : 0.0f));
 
         // Update best bounds
         // Detach currentBound immediately to prevent any gradient tracking issues
@@ -451,13 +532,27 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LirpaConfiguration::Bou
             improved = !bestBounds.defined() || (currentBoundDetached > bestBounds).any().item<bool>();
             if (improved) {
                 bestBounds = bestBounds.defined() ? torch::max(bestBounds, currentBoundDetached).detach() : currentBoundDetached.clone();
+                // Update best width
+                if (currentLower.defined() && currentUpper.defined() && currentLower.numel() > 0) {
+                    torch::Tensor width_tensor = currentUpper - currentLower;
+                    best_width = width_tensor.mean().item<float>();
+                }
                 updateBestAlphas({0}, isLower);
+                log(Stringf("computeOptimizedBounds() - Iter %u: IMPROVED lower bound (new best width=%.6f)",
+                            iter + 1, best_width));
             }
         } else {
             improved = !bestBounds.defined() || (currentBoundDetached < bestBounds).any().item<bool>();
             if (improved) {
                 bestBounds = bestBounds.defined() ? torch::min(bestBounds, currentBoundDetached).detach() : currentBoundDetached.clone();
+                // Update best width
+                if (currentLower.defined() && currentUpper.defined() && currentLower.numel() > 0) {
+                    torch::Tensor width_tensor = currentUpper - currentLower;
+                    best_width = width_tensor.mean().item<float>();
+                }
                 updateBestAlphas({0}, isLower);
+                log(Stringf("computeOptimizedBounds() - Iter %u: IMPROVED upper bound (new best width=%.6f)",
+                            iter + 1, best_width));
             }
         }
 
@@ -492,15 +587,44 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LirpaConfiguration::Bou
             bool has_gradients = false;
             float total_grad_norm = 0.0f;
             int params_with_grad = 0;
+            float max_grad = 0.0f;
+            float min_grad = 0.0f;
             for (const auto& param : alphaParams) {
                 if (param.grad().defined() && param.grad().numel() > 0) {
                     has_gradients = true;
-                    total_grad_norm += param.grad().norm().item<float>();
+                    float grad_norm = param.grad().norm().item<float>();
+                    total_grad_norm += grad_norm;
                     params_with_grad++;
+                    float grad_max = param.grad().max().item<float>();
+                    float grad_min = param.grad().min().item<float>();
+                    if (grad_max > max_grad) max_grad = grad_max;
+                    if (grad_min < min_grad) min_grad = grad_min;
                 }
+            }
+            
+            // Log gradient and loss statistics
+            if (loss.defined()) {
+                log(Stringf("computeOptimizedBounds() - Iter %u: loss=%.6f, has_gradients=%s, "
+                            "grad_norm=%.6f, grad_range=[%.6f, %.6f], params_with_grad=%d/%zu",
+                            iter + 1, loss.item<float>(), has_gradients ? "yes" : "no",
+                            total_grad_norm, min_grad, max_grad, params_with_grad, alphaParams.size()));
             }
 
             optimizer->step();
+            
+            // Log alpha statistics after update
+            auto& storageMap = isLower ? _alphaByNodeStartLower : _alphaByNodeStartUpper;
+            for (auto& [nodeIdx, perStart] : storageMap) {
+                for (auto& [startKey, ap] : perStart) {
+                    if (ap.alpha.defined() && iter == 0) {  // Log only first iteration to avoid spam
+                        log(Stringf("computeOptimizedBounds() - Iter %u: Node %u [%s] alpha after update: "
+                                    "min=%.6f, max=%.6f, mean=%.6f",
+                                    iter + 1, nodeIdx, startKey.c_str(),
+                                    ap.alpha.min().item<float>(), ap.alpha.max().item<float>(),
+                                    ap.alpha.mean().item<float>()));
+                    }
+                }
+            }
 
             // Clip alphas to [0,1]
             clipAlphaParameters();
@@ -521,13 +645,34 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LirpaConfiguration::Bou
     _crownAnalysis->resetProcessingState();
     _crownAnalysis->run(false); // Final pass doesn't need gradients
 
-    torch::Tensor finalBound = isLower ? extractLowerBoundsFromCROWN() : extractUpperBoundsFromCROWN();
+    torch::Tensor finalLower = extractLowerBoundsFromCROWN();
+    torch::Tensor finalUpper = extractUpperBoundsFromCROWN();
+    torch::Tensor finalBound = isLower ? finalLower : finalUpper;
     if (bestBounds.defined()) {
         finalBound = isLower ? torch::max(finalBound, bestBounds) : torch::min(finalBound, bestBounds);
+    }
+    
+    // Compute final bound width
+    float final_width = 0.0f;
+    if (finalLower.defined() && finalUpper.defined() && finalLower.numel() > 0) {
+        torch::Tensor width_tensor = finalUpper - finalLower;
+        final_width = width_tensor.mean().item<float>();
+    }
+    
+    // Compute total improvement
+    float total_improvement_pct = 0.0f;
+    if (initial_width > 0) {
+        total_improvement_pct = ((initial_width - final_width) / initial_width) * 100.0f;
     }
 
     log(Stringf("computeOptimizedBounds() - Optimization completed for %s bounds",
                 isLower ? "LOWER" : "UPPER"));
+    log(Stringf("computeOptimizedBounds() - Final bound width: %.6f (initial: %.6f, improvement: %.2f%%)",
+                final_width, initial_width, total_improvement_pct));
+    if (finalBound.defined() && finalBound.numel() > 0) {
+        log(Stringf("computeOptimizedBounds() - Final bound range: [%.6f, %.6f]",
+                    finalBound.min().item<float>(), finalBound.max().item<float>()));
+    }
 
     return finalBound;
 }
@@ -1525,9 +1670,8 @@ void AlphaCROWNAnalysis::updateFromConfig()
 
 void AlphaCROWNAnalysis::log(const String& message)
 {
-    (void)message;
-    if (LirpaConfiguration::NETWORK_LEVEL_REASONER_LOGGING) {
-        //printf("AlphaCROWNAnalysis: %s\n", message.ascii());
+    if (LirpaConfiguration::NETWORK_LEVEL_REASONER_LOGGING || LirpaConfiguration::VERBOSE) {
+        printf("AlphaCROWNAnalysis: %s\n", message.ascii());
     }
 }
 

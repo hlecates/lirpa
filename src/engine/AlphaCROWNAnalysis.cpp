@@ -594,11 +594,11 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LunaConfiguration::Boun
             }
             log(Stringf("computeOptimizedBounds() - Iter %u: IMPROVED %s bound (new best width=%.6f)",
                         iter + 1, isLower ? "lower" : "upper", best_width));
-
-            // Snapshot intermediate bounds when we find better bounds
-            // This captures the pre-activation bounds at this improved state
-            snapshotBestIntermediateBounds();
         }
+
+        // Track best intermediate bounds every iteration (element-wise best)
+        // This captures the tightest pre-activation bounds seen across all iterations
+        snapshotBestIntermediateBounds();
 
         // Track convergence for early stopping
         float current_loss = loss.defined() ? std::abs(loss.item<float>()) : 0.0f;
@@ -882,14 +882,14 @@ void AlphaCROWNAnalysis::restoreBestAlphas(bool isLower)
 
 void AlphaCROWNAnalysis::snapshotBestIntermediateBounds()
 {
-    log("snapshotBestIntermediateBounds() - Capturing coherent point-in-time snapshot of PRE-ACTIVATION bounds");
+    // Element-wise best tracking: keep the tightest bounds ever seen for each layer
+    // - Lower bounds: take max (tighter lower = higher value)
+    // - Upper bounds: take min (tighter upper = lower value)
+    // This may produce a combined state that never actually occurred together,
+    // but tighter bounds are always sound for verification.
 
-    // Clear previous snapshot and store entire current state as a coherent snapshot
-    // This ensures the restored bounds represent a real state that actually occurred,
-    // not an element-wise merge that may never have existed
-    _bestIntermediateBounds.clear();
-
-    unsigned numNodesSnapshoted = 0;
+    unsigned numNodesUpdated = 0;
+    unsigned numNodesNew = 0;
 
     // Iterate through all nodes and capture PRE-ACTIVATION bounds (inputs to ReLU)
     unsigned numNodes = _crownAnalysis->getNumNodes();
@@ -897,12 +897,11 @@ void AlphaCROWNAnalysis::snapshotBestIntermediateBounds()
         auto node = _crownAnalysis->getNode(nodeIdx);
         if (!node) continue;
 
-        // Only snapshot bounds for nodes that are INPUTS to ReLU layers
+        // Only track bounds for nodes that are INPUTS to ReLU layers
         bool isPreActivation = false;
 
         // Check if this node feeds into a ReLU
         for (const auto& [reluIdx, reluNode] : _optimizableNodes) {
-            // Get dependencies of the ReLU node
             auto deps = _torchModel->getDependencies(reluIdx);
             for (unsigned depIdx : deps) {
                 if (depIdx == nodeIdx) {
@@ -916,16 +915,30 @@ void AlphaCROWNAnalysis::snapshotBestIntermediateBounds()
         if (!isPreActivation) continue;
 
         if (_crownAnalysis->hasConcreteBounds(nodeIdx)) {
-            torch::Tensor lower = _crownAnalysis->getConcreteLowerBound(nodeIdx);
-            torch::Tensor upper = _crownAnalysis->getConcreteUpperBound(nodeIdx);
+            torch::Tensor currentLower = _crownAnalysis->getConcreteLowerBound(nodeIdx).detach();
+            torch::Tensor currentUpper = _crownAnalysis->getConcreteUpperBound(nodeIdx).detach();
 
-            _bestIntermediateBounds[nodeIdx] = std::make_pair(lower.detach().clone(), upper.detach().clone());
-            numNodesSnapshoted++;
+            auto it = _bestIntermediateBounds.find(nodeIdx);
+            if (it != _bestIntermediateBounds.end()) {
+                // Element-wise merge: keep tightest bounds
+                torch::Tensor& storedLower = it->second.first;
+                torch::Tensor& storedUpper = it->second.second;
+
+                storedLower = torch::max(storedLower, currentLower).clone();
+                storedUpper = torch::min(storedUpper, currentUpper).clone();
+                numNodesUpdated++;
+            } else {
+                // First time seeing this node
+                _bestIntermediateBounds[nodeIdx] = std::make_pair(currentLower.clone(), currentUpper.clone());
+                numNodesNew++;
+            }
         }
     }
 
-    log(Stringf("snapshotBestIntermediateBounds() - Captured coherent snapshot for %u pre-activation nodes",
-                numNodesSnapshoted));
+    if (numNodesNew > 0 || numNodesUpdated > 0) {
+        log(Stringf("snapshotBestIntermediateBounds() - Element-wise best: %u nodes updated, %u nodes new",
+                    numNodesUpdated, numNodesNew));
+    }
 }
 
 void AlphaCROWNAnalysis::restoreBestIntermediateBounds()

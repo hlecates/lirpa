@@ -121,10 +121,12 @@ void AlphaCROWNAnalysis::prepareOptimizableActivations()
 
 void AlphaCROWNAnalysis::performCROWNInitializationPass()
 {
+    // Run standard CROWN to capture relaxation slopes for alpha initialization
+    // This pass is critical for bound tightness - it provides good starting points
     log("performCROWNInitializationPass() - Running standard CROWN to capture relaxation slopes");
 
     LunaConfiguration::ENABLE_FIRST_LINEAR_IBP = false;
-    
+
     _crownAnalysis->resetProcessingState();
 
     _crownAnalysis->run(false); // No gradients needed for initialization pass
@@ -334,8 +336,14 @@ AlphaParameters& AlphaCROWNAnalysis::ensureAlphaFor(
                 // Get CROWN lower-face choice (0 or 1) as initialization
                 torch::Tensor full_slope = nodePtr->getCROWNSlope(true);  // [outDim], entries 0 or 1
                 full_slope_debug = full_slope;
-                // Extract only unstable neuron slopes using index_select
-                slope_init = full_slope.flatten().index_select(0, params.unstableIndices);  // [numUnstable]
+                // FIX: Handle case where slopes aren't available (init pass was skipped)
+                if (full_slope.defined() && full_slope.numel() > 0) {
+                    // Extract only unstable neuron slopes using index_select
+                    slope_init = full_slope.flatten().index_select(0, params.unstableIndices);  // [numUnstable]
+                } else {
+                    // No slopes available - use 0.5 as default (midpoint of valid range)
+                    slope_init = torch::full({numUnstable}, 0.5f, options);
+                }
             } else {
                 // Safe fallback: use 0.5 for unstable neurons (midpoint of valid range)
                 slope_init = torch::full({numUnstable}, 0.5f, options);
@@ -476,19 +484,13 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LunaConfiguration::Boun
 
     snapshotBestIntermediateBounds();
 
-    torch::Tensor initialLower = extractLowerBoundsFromCROWN();
-    torch::Tensor initialUpper = extractUpperBoundsFromCROWN();
-    torch::Tensor initialBound = isLower ? initialLower : initialUpper;
-
-    float initial_width = 0.0f;
-    if (initialLower.defined() && initialUpper.defined() && initialLower.numel() > 0) {
-        initial_width = (initialUpper - initialLower).mean().item<float>();
-    }
+    // Only extract the bound we need (minor optimization that doesn't affect tightness)
+    torch::Tensor initialBound = isLower ? extractLowerBoundsFromCROWN() : extractUpperBoundsFromCROWN();
 
     auto alphaParams = collectAlphaParameters(isLower);
     if (alphaParams.empty()) {
         _crownAnalysis->run(false);
-        return side == LunaConfiguration::BoundSide::Lower ? extractLowerBoundsFromCROWN() : extractUpperBoundsFromCROWN();
+        return isLower ? extractLowerBoundsFromCROWN() : extractUpperBoundsFromCROWN();
     }
 
     auto optimizer = std::make_shared<torch::optim::Adam>(
@@ -496,7 +498,6 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LunaConfiguration::Boun
         torch::optim::AdamOptions(_learningRate).betas(std::make_tuple(0.9, 0.999)).eps(1e-8));
 
     torch::Tensor bestBounds;
-    float best_width = initial_width;
     float currentLR = _learningRate;
     const unsigned early_stop_patience = 5;
     unsigned iterations_without_improvement = 0;
@@ -513,14 +514,15 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LunaConfiguration::Boun
         _crownAnalysis->resetProcessingState();
         _crownAnalysis->run(true);
 
-        torch::Tensor currentLower = extractLowerBoundsFromCROWN();
-        torch::Tensor currentUpper = extractUpperBoundsFromCROWN();
-        torch::Tensor currentBound = isLower ? currentLower : currentUpper;
+        // FIX: Only extract the bound we need (avoid redundant computation)
+        torch::Tensor currentBound = isLower ? extractLowerBoundsFromCROWN() : extractUpperBoundsFromCROWN();
         torch::Tensor currentBoundDetached = currentBound.detach();
 
         torch::Tensor loss;
         if (iter < _iteration - 1) {
-            loss = computeLoss(currentLower, currentUpper, isLower);
+            // FIX: computeLoss only uses one bound anyway, so pass currentBound for the relevant side
+            loss = isLower ? computeLoss(currentBound, torch::Tensor(), isLower)
+                           : computeLoss(torch::Tensor(), currentBound, isLower);
         }
 
         bool improved = false;
@@ -549,9 +551,8 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LunaConfiguration::Boun
         }
 
         if (improved) {
-            if (currentLower.defined() && currentUpper.defined() && currentLower.numel() > 0) {
-                best_width = (currentUpper - currentLower).mean().item<float>();
-            }
+            // FIX: Skip width computation since we only extract one bound now
+            // Width tracking was only for logging and doesn't affect optimization
             snapshotBestIntermediateBounds();
         }
 
@@ -592,23 +593,14 @@ torch::Tensor AlphaCROWNAnalysis::computeOptimizedBounds(LunaConfiguration::Boun
     _crownAnalysis->resetProcessingState();
     _crownAnalysis->run(false);
 
-    torch::Tensor finalLower = extractLowerBoundsFromCROWN();
-    torch::Tensor finalUpper = extractUpperBoundsFromCROWN();
-    torch::Tensor finalBound = isLower ? finalLower : finalUpper;
+    // FIX: Only extract the bound we need
+    torch::Tensor finalBound = isLower ? extractLowerBoundsFromCROWN() : extractUpperBoundsFromCROWN();
     if (bestBounds.defined()) {
         finalBound = isLower ? torch::max(finalBound, bestBounds) : torch::min(finalBound, bestBounds);
     }
 
-    float final_width = 0.0f;
-    if (finalLower.defined() && finalUpper.defined() && finalLower.numel() > 0) {
-        final_width = (finalUpper - finalLower).mean().item<float>();
-    }
-    float total_improvement_pct = 0.0f;
-    if (initial_width > 0) {
-        total_improvement_pct = ((initial_width - final_width) / initial_width) * 100.0f;
-    }
-    log(Stringf("computeOptimizedBounds() - Final bound width: %.6f (initial: %.6f, improvement: %.2f%%)",
-                final_width, initial_width, total_improvement_pct));
+    log(Stringf("computeOptimizedBounds() - %s bound optimization completed",
+                isLower ? "Lower" : "Upper"));
 
     return finalBound;
 }
@@ -1202,6 +1194,16 @@ void AlphaCROWNAnalysis::log(const String& message)
 {
     if (LunaConfiguration::NETWORK_LEVEL_REASONER_LOGGING || LunaConfiguration::VERBOSE) {
         printf("AlphaCROWNAnalysis: %s\n", message.ascii());
+    }
+}
+
+void AlphaCROWNAnalysis::preserveIntermediateBoundsForNextOptimization()
+{
+    // Mark that intermediate bounds should be reused for the next optimization call
+    // This avoids redundant CROWN passes when optimizing both lower and upper bounds
+    _reuseIntermediateBounds = !_bestIntermediateBounds.empty();
+    if (_reuseIntermediateBounds) {
+        log("preserveIntermediateBoundsForNextOptimization() - Intermediate bounds preserved for reuse");
     }
 }
 

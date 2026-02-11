@@ -14,7 +14,7 @@ public:
     BoundedConvNode(const torch::nn::Conv1d& convModule,
                      ConvMode mode = ConvMode::MATRIX,
                      const String& name = "");
-    
+
     // Constructor for Conv2d
     BoundedConvNode(const torch::nn::Conv2d& convModule,
                      ConvMode mode = ConvMode::MATRIX,
@@ -107,6 +107,11 @@ private:
     int groups;                    // Number of groups for grouped convolution
     bool has_bias;                 // Whether bias is present
 
+    // Pre-converted int64_t versions (avoid conversion overhead in hot path)
+    std::vector<int64_t> stride_64;
+    std::vector<int64_t> padding_64;
+    std::vector<int64_t> dilation_64;
+
     // Mode and optimization flags
     ConvMode mode;                 // MATRIX or PATCHES mode
     bool relu_followed;            // Whether this conv is followed by ReLU
@@ -115,6 +120,15 @@ private:
     // Cached shapes
     std::vector<int> input_shape;   // Shape of input tensor
     std::vector<int> output_shape;  // Shape of output tensor
+
+    // Cached weight/bias on device - avoids repeated .to() conversions
+    // These are populated on first use and invalidated when device changes
+    mutable torch::Tensor _cached_weight;
+    mutable torch::Tensor _cached_bias;
+    mutable torch::Device _cached_device{torch::kCPU};
+
+    // Helper to get weight/bias on the target device (uses cache)
+    void ensureWeightsOnDevice(const torch::Device& device) const;
 };
 
 } // namespace NLR

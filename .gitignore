@@ -242,6 +242,7 @@ test_acas_auto.py
 run_acas_alpha_crown.py
 run_cora_alpha_crown.py
 run_safenlp_alpha_crown.py
+run_tllverifybench_alpha_crown.py
 
 auto_LiRPA/
 

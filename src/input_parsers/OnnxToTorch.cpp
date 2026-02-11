@@ -2301,7 +2301,7 @@ namespace BoundedOperationConverter {
                 conv_module->bias = bias;
             }
 
-            // Create bounded convolution node with default MATRIX mode
+            // Create bounded convolution node with MATRIX mode
             boundedNode = std::make_shared<NLR::BoundedConvNode>(conv_module,
                                                                    NLR::ConvMode::MATRIX);
         }

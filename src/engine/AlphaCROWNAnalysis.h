@@ -102,6 +102,13 @@ public:
     // This method handles the complete optimization loop internally
     torch::Tensor computeOptimizedBounds(LunaConfiguration::BoundSide side);
 
+    // Preserve intermediate bounds for reuse in next optimization call
+    // Call this after first optimization (e.g., upper) to reuse state for second (e.g., lower)
+    void preserveIntermediateBoundsForNextOptimization();
+
+    // Check if intermediate bounds are available for reuse
+    bool hasIntermediateBoundsForReuse() const { return _reuseIntermediateBounds; }
+
     /* DEPRECATED - OLD IMPLEMENTATIONS
     std::pair<torch::Tensor, torch::Tensor> computeBoundsWithAlpha(BoundSide side);
 
@@ -177,6 +184,7 @@ private:
     // Removed _config member variable
     bool _alphaEnabled;         // Whether alpha optimization is enabled
     bool _initialized;          // Whether alpha parameters have been initialized
+    bool _reuseIntermediateBounds{false}; // Reuse intermediate bounds from previous optimization
     unsigned _iteration;        // Number of optimization iterations (default: 20)
     float _learningRate;        // Learning rate for alpha optimization (default: 0.5)
     std::string _optimizationStage;  // Current optimization stage

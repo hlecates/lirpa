@@ -2108,6 +2108,20 @@ void CROWNAnalysis::computeIntermediateBoundsLazy(unsigned nodeIndex)
                     nodeIndex, unstableIndices.size(), (long long)lb.numel()));
     }
 
+    // Match auto_LiRPA behavior: if there are no unstable neurons for this
+    // intermediate start node, skip backward CROWN and keep reference/IBP bounds.
+    // This avoids constructing dense identity A matrices of size [nodeSize, ...],
+    // which can cause severe memory blowups on conv layers.
+    if (unstableIndices.empty() && _ibpBounds.exists(nodeIndex)) {
+        auto ibp = _ibpBounds[nodeIndex];
+        _concreteBounds[nodeIndex] = ibp;
+        _torchModel->setConcreteBounds(nodeIndex, ibp);
+        if (_nodes.exists(nodeIndex)) {
+            _nodes[nodeIndex]->setBounds(ibp.lower(), ibp.upper());
+        }
+        return;
+    }
+
     // Set current start context for this intermediate node
     auto& node = _nodes[nodeIndex];
     unsigned nodeSize = node->getOutputSize();

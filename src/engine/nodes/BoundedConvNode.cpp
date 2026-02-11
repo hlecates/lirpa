@@ -110,6 +110,11 @@ void BoundedConvNode::initializeFromConv1d(const torch::nn::Conv1d& convModule) 
             }
         }
     }
+
+    // Pre-convert to int64_t to avoid repeated conversions in hot path
+    stride_64 = std::vector<int64_t>(stride.begin(), stride.end());
+    padding_64 = std::vector<int64_t>(padding.begin(), padding.end());
+    dilation_64 = std::vector<int64_t>(dilation.begin(), dilation.end());
 }
 
 void BoundedConvNode::initializeFromConv2d(const torch::nn::Conv2d& convModule) {
@@ -191,6 +196,11 @@ void BoundedConvNode::initializeFromConv2d(const torch::nn::Conv2d& convModule) 
             }
         }
     }
+
+    // Pre-convert to int64_t to avoid repeated conversions in hot path
+    stride_64 = std::vector<int64_t>(stride.begin(), stride.end());
+    padding_64 = std::vector<int64_t>(padding.begin(), padding.end());
+    dilation_64 = std::vector<int64_t>(dilation.begin(), dilation.end());
 }
 
 // Forward pass
@@ -211,25 +221,19 @@ torch::Tensor BoundedConvNode::forward(const torch::Tensor& input) {
 
     torch::Tensor output;
     
+    // Ensure cached weights are on the target device (fast path if already cached)
+    ensureWeightsOnDevice(device);
+    const torch::Tensor& weight = _cached_weight;
+    const torch::Tensor& bias = _cached_bias;
+
     if (conv_dim == 1) {
         // 1D convolution
         if (!conv1d) {
             throw std::runtime_error("Conv1d module not initialized");
         }
 
-        // Get weight and bias on the input device
-        torch::Tensor weight = conv1d->weight
-            .to(torch::TensorOptions().dtype(torch::kFloat32).device(device))
-            .contiguous();
-        torch::Tensor bias = has_bias
-            ? conv1d->bias.to(torch::TensorOptions().dtype(torch::kFloat32).device(device))
-            : torch::Tensor();
-
         // Direct convolution for 1D (matrix mode not implemented for 1D)
-        std::vector<int64_t> stride_64(stride.begin(), stride.end());
-        std::vector<int64_t> padding_64(padding.begin(), padding.end());
-        std::vector<int64_t> dilation_64(dilation.begin(), dilation.end());
-
+        // Use pre-cached int64_t vectors from initialization
         output = torch::nn::functional::conv1d(
             inputFloat, weight,
             torch::nn::functional::Conv1dFuncOptions()
@@ -244,14 +248,6 @@ torch::Tensor BoundedConvNode::forward(const torch::Tensor& input) {
         if (!conv2d) {
             throw std::runtime_error("Conv2d module not initialized");
         }
-
-        // Get weight and bias on the input device
-        torch::Tensor weight = conv2d->weight
-            .to(torch::TensorOptions().dtype(torch::kFloat32).device(device))
-            .contiguous();
-        torch::Tensor bias = has_bias
-            ? conv2d->bias.to(torch::TensorOptions().dtype(torch::kFloat32).device(device))
-            : torch::Tensor();
 
         if (mode == ConvMode::MATRIX) {
             // Matrix mode using im2col
@@ -274,11 +270,7 @@ torch::Tensor BoundedConvNode::forward(const torch::Tensor& input) {
                 input_matrix, weight, bias, spatial_output
             );
         } else {
-            // Direct convolution
-            std::vector<int64_t> stride_64(stride.begin(), stride.end());
-            std::vector<int64_t> padding_64(padding.begin(), padding.end());
-            std::vector<int64_t> dilation_64(dilation.begin(), dilation.end());
-
+            // Direct convolution - use pre-cached int64_t vectors
             output = torch::nn::functional::conv2d(
                 inputFloat, weight,
                 torch::nn::functional::Conv2dFuncOptions()
@@ -313,6 +305,36 @@ void BoundedConvNode::moveToDevice(const torch::Device& device)
     if (conv2d) {
         conv2d->to(device);
     }
+    // Invalidate cache - will be repopulated on next use
+    _cached_weight = torch::Tensor();
+    _cached_bias = torch::Tensor();
+}
+
+void BoundedConvNode::ensureWeightsOnDevice(const torch::Device& device) const
+{
+    // Fast path: already cached on the right device
+    if (_cached_weight.defined() && _cached_device == device) {
+        return;
+    }
+
+    // Cache weight and bias on the target device
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    if (conv_dim == 1 && conv1d) {
+        _cached_weight = conv1d->weight.to(options).contiguous();
+        if (has_bias && conv1d->bias.defined()) {
+            _cached_bias = conv1d->bias.to(options);
+        } else {
+            _cached_bias = torch::Tensor();
+        }
+    } else if (conv_dim == 2 && conv2d) {
+        _cached_weight = conv2d->weight.to(options).contiguous();
+        if (has_bias && conv2d->bias.defined()) {
+            _cached_bias = conv2d->bias.to(options);
+        } else {
+            _cached_bias = torch::Tensor();
+        }
+    }
+    _cached_device = device;
 }
 
 // Backward bound propagation
@@ -440,8 +462,7 @@ void BoundedConvNode::boundBackward(
         throw std::runtime_error("BoundedConvNode expects at least one input");
     }
 
-    // Get weight and bias on the same device as A/input bounds
-    torch::Tensor weight, bias;
+    // Determine target device from inputs
     torch::Device device = _device;
     if (last_lA.defined() && last_lA.isTensor()) {
         device = last_lA.asTensor().device();
@@ -450,23 +471,11 @@ void BoundedConvNode::boundBackward(
     } else if (!inputBounds.empty() && inputBounds[0].lower().defined()) {
         device = inputBounds[0].lower().device();
     }
-    if (conv_dim == 1) {
-        if (!conv1d) {
-            throw std::runtime_error("Conv1d module not initialized");
-        }
-        weight = conv1d->weight.to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
-        bias = has_bias
-            ? conv1d->bias.to(torch::TensorOptions().dtype(torch::kFloat32).device(device))
-            : torch::Tensor();
-    } else {
-        if (!conv2d) {
-            throw std::runtime_error("Conv2d module not initialized");
-        }
-        weight = conv2d->weight.to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
-        bias = has_bias
-            ? conv2d->bias.to(torch::TensorOptions().dtype(torch::kFloat32).device(device))
-            : torch::Tensor();
-    }
+
+    // Use cached weights (fast path if already on the right device)
+    ensureWeightsOnDevice(device);
+    const torch::Tensor& weight = _cached_weight;
+    const torch::Tensor& bias = _cached_bias;
 
     // Compute bounds for lower and upper
     torch::Tensor lA_bias_contrib, uA_bias_contrib;
@@ -561,11 +570,7 @@ BoundA BoundedConvNode::boundOneSide(const BoundA& last_A,
             }
         }
 
-        // Convert to int64_t
-        //Could cache the stride, dilation etc since they are constant -- but def not the bottleneck rn
-        std::vector<int64_t> stride_64(stride.begin(), stride.end());
-        std::vector<int64_t> padding_64(padding.begin(), padding.end());
-        std::vector<int64_t> dilation_64(dilation.begin(), dilation.end());
+        // Use pre-cached int64_t vectors; only output_padding needs conversion
         std::vector<int64_t> output_padding_64(output_padding.begin(), output_padding.end());
 
         // Apply transpose convolution
@@ -619,113 +624,51 @@ BoundA BoundedConvNode::boundOneSide(const BoundA& last_A,
             }
         }
         
-        // Handle bias
-        // Each spatial dim across channels receives the same conv bias contribution
-        // So below we sum across the spatial dims (ie the L or H,W) of each indexes A value, then multiply by the bias contribution for that channel
-        //      eg rather than doing (a_1 * bias) + ... + (a_n * bias) we do (a_1 + ... + a_n) * bias
-        // Then since we need a single scalar in final concretization we sum the bias value across the channels to get the conv's sum of constant contributions
+        // Handle bias using torch::einsum for efficient single-operation computation
         if (has_bias && bias.defined()) {
             if (conv_dim == 1) {
-                // 1D convolution bias handling
+                // Conv1d bias computation
                 if (shape.size() == 4) {
-                    // [S, B, C, L] where C is output channels of this conv
-                    // Sum over spatial dimension L first: [S, B, C]
-                    torch::Tensor sum_spatial = last_A_tensor.sum({3});
-                    torch::Tensor bias_expanded = bias.unsqueeze(0).unsqueeze(0); // [1, 1, C]
-                    torch::Tensor product = sum_spatial * bias_expanded; // [S, B, C]
-                    sum_bias = product.sum(-1); // [S, B]
+                    // [S, B, C, L] -> einsum('sbcl,c->sb')
+                    sum_bias = torch::einsum("sbcl,c->sb", {last_A_tensor, bias});
                 } else if (shape.size() == 3) {
-                    // Handle [B, C, L] or [S, B, flat]
-                    if (output_shape.size() >= 3 && !was_flat) {
-                        torch::Tensor sum_spatial = last_A_tensor.sum({2}); // [B, C]
-                        torch::Tensor bias_expanded = bias.unsqueeze(0); // [1, C]
-                        torch::Tensor product = sum_spatial * bias_expanded; // [B, C]
-                        sum_bias = product.sum(-1); // [B]
-                    } else if (output_shape.size() >= 3) {
-                        // Reshape from flat to [S, B, C, L]
-                        torch::Tensor reshaped = last_A_tensor.reshape({shape[0], shape[1],
-                                                                       output_shape[1], output_shape[2]});
-                        torch::Tensor sum_spatial = reshaped.sum({3}); // [S, B, C]
-                        torch::Tensor bias_expanded = bias.unsqueeze(0).unsqueeze(0); // [1, 1, C]
-                        torch::Tensor product = sum_spatial * bias_expanded; // [S, B, C]
-                        sum_bias = product.sum(-1); // [S, B]
+                    if (was_flat && output_shape.size() >= 3) {
+                        // Reshape [S, B, flat] -> [S, B, C, L] then einsum
+                        auto reshaped = last_A_tensor.reshape({shape[0], shape[1], output_shape[1], output_shape[2]});
+                        sum_bias = torch::einsum("sbcl,c->sb", {reshaped, bias});
                     } else {
-                        sum_bias = torch::zeros({shape[0], shape[1]}, last_A_tensor.options());
+                        // [B, C, L] -> einsum('bcl,c->b')
+                        sum_bias = torch::einsum("bcl,c->b", {last_A_tensor, bias});
                     }
-                } else if (shape.size() == 2) {
-                    // [B, flat] - need to reshape
-                    if (output_shape.size() >= 3) {
-                        torch::Tensor reshaped = last_A_tensor.reshape({shape[0], output_shape[1], output_shape[2]});
-                        torch::Tensor sum_spatial = reshaped.sum({2}); // [B, C]
-                        torch::Tensor bias_expanded = bias.unsqueeze(0); // [1, C]
-                        torch::Tensor product = sum_spatial * bias_expanded; // [B, C]
-                        sum_bias = product.sum(-1).unsqueeze(0); // [1, B] for consistency
-                    } else {
-                        sum_bias = torch::zeros({1, shape[0]}, last_A_tensor.options());
-                    }
+                } else if (shape.size() == 2 && output_shape.size() >= 3) {
+                    auto reshaped = last_A_tensor.reshape({shape[0], output_shape[1], output_shape[2]});
+                    sum_bias = torch::einsum("bcl,c->b", {reshaped, bias});
                 } else {
                     sum_bias = torch::zeros({1}, last_A_tensor.options());
                 }
             } else {
-                // 2D convolution bias handling
+                // Conv2d bias computation
                 if (shape.size() == 5) {
-                    // [S, B, C, H, W] where C is output channels of this conv
-                    // Sum over spatial dimensions H, W first: [S, B, C]
-                    torch::Tensor sum_spatial = last_A_tensor.sum({3, 4});
-                    torch::Tensor bias_expanded = bias.unsqueeze(0).unsqueeze(0); // [1, 1, C]
-                    torch::Tensor product = sum_spatial * bias_expanded; // [S, B, C]
-                    sum_bias = product.sum(-1); // [S, B]
+                    // [S, B, C, H, W] -> einsum('sbchw,c->sb')
+                    sum_bias = torch::einsum("sbchw,c->sb", {last_A_tensor, bias});
                 } else if (shape.size() == 4) {
-                    // [B, C, H, W] - no spec dimension
-                    torch::Tensor sum_spatial = last_A_tensor.sum({2, 3}); // [B, C]
-                    torch::Tensor bias_expanded = bias.unsqueeze(0); // [1, C]
-                    torch::Tensor product = sum_spatial * bias_expanded; // [B, C]
-                    sum_bias = product.sum(-1); // [B]
-                } else if (shape.size() == 3) {
-                    // [S, B, flat] or [B, S, flat] - need to reshape
-                    if (output_shape.size() >= 4) {
-                        // Reshape to spatial dimensions
-                        torch::Tensor reshaped = last_A_tensor.reshape({shape[0], shape[1],
-                                                                       output_shape[1], output_shape[2], output_shape[3]});
-                        torch::Tensor sum_spatial = reshaped.sum({3, 4}); // [S, B, C]
-                        torch::Tensor bias_expanded = bias.unsqueeze(0).unsqueeze(0); // [1, 1, C]
-                        torch::Tensor product = sum_spatial * bias_expanded; // [S, B, C]
-                        sum_bias = product.sum(-1); // [S, B]
-                    } else {
-                        // Fallback
-                        sum_bias = torch::zeros({shape[0], shape[1]}, last_A_tensor.options());
-                    }
-                } else if (shape.size() == 2) {
-                    // [B, flat] - need to reshape
-                    if (output_shape.size() >= 4) {
-                        torch::Tensor reshaped = last_A_tensor.reshape({shape[0],
-                                                                       output_shape[1], output_shape[2], output_shape[3]});
-                        torch::Tensor sum_spatial = reshaped.sum({2, 3}); // [B, C]
-                        torch::Tensor bias_expanded = bias.unsqueeze(0); // [1, C]
-                        torch::Tensor product = sum_spatial * bias_expanded; // [B, C]
-                        sum_bias = product.sum(-1).unsqueeze(0); // [1, B] for consistency
-                    } else {
-                        sum_bias = torch::zeros({1, shape[0]}, last_A_tensor.options());
-                    }
+                    // [B, C, H, W] -> einsum('bchw,c->b')
+                    sum_bias = torch::einsum("bchw,c->b", {last_A_tensor, bias});
+                } else if (shape.size() == 3 && output_shape.size() >= 4) {
+                    auto reshaped = last_A_tensor.reshape({shape[0], shape[1], output_shape[1], output_shape[2], output_shape[3]});
+                    sum_bias = torch::einsum("sbchw,c->sb", {reshaped, bias});
+                } else if (shape.size() == 2 && output_shape.size() >= 4) {
+                    auto reshaped = last_A_tensor.reshape({shape[0], output_shape[1], output_shape[2], output_shape[3]});
+                    sum_bias = torch::einsum("bchw,c->b", {reshaped, bias});
                 } else {
-                    // Fallback
                     sum_bias = torch::zeros({1}, last_A_tensor.options());
                 }
             }
         } else {
-            // No bias term: bias contribution is exactly 0, but the tensor shape must match
-            // the (spec, batch) convention used by the rest of the CROWN pipeline.
-            if (shape.size() == 5 || shape.size() == 4) {
-                // [S, B, C, H, W] -> [S, B] or [S, B, C, L] -> [S, B]
-                sum_bias = torch::zeros({shape[0], shape[1]}, last_A_tensor.options());
-            } else if (shape.size() == 4 || shape.size() == 3) {
-                // [B, C, H, W] -> [B] or [B, C, L] -> [B]
-                sum_bias = torch::zeros({shape[0]}, last_A_tensor.options());
-            } else if (shape.size() == 3 || shape.size() == 2) {
-                // [S, B, flat] or [B, S, flat] -> return a 2D (spec,batch)-like bias
+            // No bias - return appropriately shaped zeros
+            if (shape.size() >= 3) {
                 sum_bias = torch::zeros({shape[0], shape[1]}, last_A_tensor.options());
             } else if (shape.size() == 2) {
-                // [B, flat] or [S, flat] -> follow the existing convention used when bias exists: [1, B]
                 sum_bias = torch::zeros({1, shape[0]}, last_A_tensor.options());
             } else {
                 sum_bias = torch::zeros({1}, last_A_tensor.options());
@@ -974,20 +917,11 @@ BoundedTensor<torch::Tensor> BoundedConvNode::computeIntervalBoundPropagation(
 
     const BoundedTensor<torch::Tensor>& input = inputBounds[0];
 
-    // Get weight and bias on the input device
-    torch::Tensor weight, bias;
+    // Use cached weights (fast path if already on the right device)
     const auto device = input.lower().defined() ? input.lower().device() : _device;
-    if (conv_dim == 1) {
-        weight = conv1d->weight.to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
-        bias = has_bias
-            ? conv1d->bias.to(torch::TensorOptions().dtype(torch::kFloat32).device(device))
-            : torch::Tensor();
-    } else {
-        weight = conv2d->weight.to(torch::TensorOptions().dtype(torch::kFloat32).device(device));
-        bias = has_bias
-            ? conv2d->bias.to(torch::TensorOptions().dtype(torch::kFloat32).device(device))
-            : torch::Tensor();
-    }
+    ensureWeightsOnDevice(device);
+    const torch::Tensor& weight = _cached_weight;
+    const torch::Tensor& bias = _cached_bias;
 
     // Reshape input bounds if needed for convolution
     torch::Tensor input_lower = input.lower();
@@ -1119,11 +1053,7 @@ BoundedTensor<torch::Tensor> BoundedConvNode::computeIntervalBoundPropagation(
     torch::Tensor weight_pos = torch::clamp_min(weight, 0);
     torch::Tensor weight_neg = torch::clamp_max(weight, 0);
 
-    // Convert vectors to int64_t for LibTorch
-    std::vector<int64_t> stride_64(stride.begin(), stride.end());
-    std::vector<int64_t> padding_64(padding.begin(), padding.end());
-    std::vector<int64_t> dilation_64(dilation.begin(), dilation.end());
-
+    // Use pre-cached int64_t vectors
     torch::Tensor lower_bound, upper_bound;
     
     if (conv_dim == 1) {

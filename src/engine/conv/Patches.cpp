@@ -309,13 +309,164 @@ torch::Tensor create_valid_mask(
 torch::Tensor Patches::patches_to_matrix(
         const torch::Tensor& pieces,
         const std::vector<int64_t>& input_shape,
-        const std::vector<int64_t>& stride,
-        const std::vector<int64_t>& padding,
+        const std::vector<int64_t>& stride_in,
+        const std::vector<int64_t>& padding_in,
         const std::vector<int64_t>& output_shape,
         const std::optional<std::vector<torch::Tensor>>& unstable_idx,
         int64_t inserted_zeros
 ) {
-    throw std::runtime_error("patches_to_matrix not implemented yet in C++");
+    // Convert patches representation to dense matrix using efficient strided views
+    // This is a critical optimization - uses as_strided for zero-copy view creation
+
+    std::vector<int64_t> padding = unify_shape(padding_in);
+    std::vector<int64_t> str = stride_in;
+    if (str.size() == 1) str = {str[0], str[0]};
+
+    // Handle 9D pieces (squeeze extra dimensions)
+    torch::Tensor p = pieces;
+    if (p.dim() == 9) {
+        // Squeeze two additional dimensions for output and input respectively
+        if (p.size(1) == 1 && p.size(5) == 1) {
+            p = p.reshape({p.size(0), p.size(2), p.size(3), p.size(4),
+                          p.size(6), p.size(7), p.size(8)});
+        }
+    }
+
+    int64_t output_channel, batch_size, output_x, output_y;
+    int64_t input_channel = p.size(-3);
+    int64_t kernel_x = p.size(-2);
+    int64_t kernel_y = p.size(-1);
+    int64_t input_x = input_shape[input_shape.size() - 2];
+    int64_t input_y = input_shape[input_shape.size() - 1];
+
+    if (inserted_zeros > 0) {
+        input_x = (input_x - 1) * (inserted_zeros + 1) + 1;
+        input_y = (input_y - 1) * (inserted_zeros + 1) + 1;
+    }
+
+    torch::Tensor A_matrix;
+
+    if (!unstable_idx.has_value()) {
+        // Non-sparse case: pieces shape is (out_c, batch, out_h, out_w, c, h, w)
+        if (p.dim() != 7) {
+            throw std::runtime_error("patches_to_matrix: expected 7D tensor for non-sparse case, got " +
+                                    std::to_string(p.dim()) + "D");
+        }
+
+        output_channel = p.size(0);
+        batch_size = p.size(1);
+        output_x = p.size(2);
+        output_y = p.size(3);
+
+        // Create output matrix with room for padding
+        int64_t padded_h = input_x + padding[2] + padding[3];
+        int64_t padded_w = input_y + padding[0] + padding[1];
+
+        A_matrix = torch::zeros(
+            {batch_size, output_channel, output_x, output_y, input_channel, padded_h * padded_w},
+            p.options()
+        );
+
+        // Get strides of the output matrix
+        auto orig_stride = A_matrix.strides();
+
+        // Create strided view for efficient filling
+        // This is the key optimization - we create a view that maps to sliding windows
+        torch::Tensor matrix_strided = torch::as_strided(
+            A_matrix,
+            {batch_size, output_channel, output_x, output_y, output_x, output_y,
+             input_channel, kernel_x, kernel_y},
+            {orig_stride[0], orig_stride[1], orig_stride[2], orig_stride[3],
+             padded_h * str[0], str[1], orig_stride[4], padded_w, 1}
+        );
+
+        // Fill using diagonal indexing
+        // pieces has shape (out_c, batch, out_h, out_w, c, h, w)
+        // Need to transpose to (batch, out_c, out_h, out_w, c, h, w)
+        torch::Tensor pieces_transposed = p.permute({1, 0, 2, 3, 4, 5, 6});
+
+        // Create indices for diagonal selection
+        for (int64_t i = 0; i < output_x; ++i) {
+            for (int64_t j = 0; j < output_y; ++j) {
+                using namespace torch::indexing;
+                matrix_strided.index_put_(
+                    {Slice(), Slice(), i, j, i, j, Slice(), Slice(), Slice()},
+                    pieces_transposed.index({Slice(), Slice(), i, j, Slice(), Slice(), Slice()})
+                );
+            }
+        }
+
+        // Reshape to final form
+        A_matrix = A_matrix.view({batch_size, output_channel * output_x * output_y,
+                                  input_channel, padded_h, padded_w});
+    } else {
+        // Sparse case: pieces shape is (unstable_size, batch, c, h, w)
+        const auto& idx = unstable_idx.value();
+        int64_t unstable_size = idx[0].numel();
+        batch_size = p.size(1);
+        output_channel = output_shape[1];
+        output_x = output_shape[2];
+        output_y = output_shape[3];
+
+        // Create partial A matrix for unstable neurons only
+        int64_t padded_h = input_x + padding[2] + padding[3];
+        int64_t padded_w = input_y + padding[0] + padding[1];
+
+        A_matrix = torch::zeros(
+            {batch_size, unstable_size, input_channel, padded_h * padded_w},
+            p.options()
+        );
+
+        auto orig_stride = A_matrix.strides();
+
+        // Create strided view
+        torch::Tensor matrix_strided = torch::as_strided(
+            A_matrix,
+            {batch_size, unstable_size, output_x, output_y, input_channel, kernel_x, kernel_y},
+            {orig_stride[0], orig_stride[1], padded_h * str[0], str[1], orig_stride[2], padded_w, 1}
+        );
+
+        // pieces has shape (unstable_size, batch, c, h, w)
+        // Transpose to (batch, unstable_size, c, h, w)
+        torch::Tensor pieces_transposed = p.permute({1, 0, 2, 3, 4});
+
+        // Fill at unstable positions
+        // idx[1] = out_h indices, idx[2] = out_w indices
+        for (int64_t i = 0; i < unstable_size; ++i) {
+            int64_t h_idx = idx[1][i].item<int64_t>();
+            int64_t w_idx = idx[2][i].item<int64_t>();
+            using namespace torch::indexing;
+            matrix_strided.index_put_(
+                {Slice(), i, h_idx, w_idx, Slice(), Slice(), Slice()},
+                pieces_transposed.index({Slice(), i, Slice(), Slice(), Slice()})
+            );
+        }
+
+        // Reshape to final form
+        A_matrix = A_matrix.view({batch_size, unstable_size, input_channel, padded_h, padded_w});
+    }
+
+    // Remove padding from the result
+    {
+        using namespace torch::indexing;
+        A_matrix = A_matrix.index({
+            Slice(), Slice(), Slice(),
+            Slice(padding[2], input_x + padding[2]),
+            Slice(padding[0], input_y + padding[0])
+        });
+    }
+
+    // Handle inserted zeros - subsample to remove them
+    if (inserted_zeros > 0) {
+        using namespace torch::indexing;
+        A_matrix = A_matrix.index({
+            Slice(), Slice(), Slice(),
+            Slice(None, None, inserted_zeros + 1),
+            Slice(None, None, inserted_zeros + 1)
+        });
+    }
+
+    return A_matrix;
 }
 
 } // namespace NLR

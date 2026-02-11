@@ -741,10 +741,12 @@ BoundA BoundedConvNode::boundOneSide(const BoundA& last_A,
         
         if (last_patches->identity == 0) {
             torch::Tensor patches_tensor;
+            bool is_sparse = last_patches->unstable_idx.has_value();
+
             if (!relu_followed) {
                 std::vector<int64_t> output_shape_vec;
                 for(int s : output_shape) output_shape_vec.push_back(s);
-                
+
                 torch::Tensor mask = create_valid_mask(
                     output_shape_vec,
                     last_patches->patches.device(),
@@ -760,62 +762,98 @@ BoundA BoundedConvNode::boundOneSide(const BoundA& last_A,
             } else {
                 patches_tensor = last_patches->patches;
             }
-            
+
+            // Compute bias contribution using einsum-style computation
+            // For sparse patches: shape is [unstable_size, batch, c, h, w]
+            // For dense patches: shape is [out_c, batch, out_h, out_w, c, h, w]
             if (has_bias && bias.defined()) {
-                
-                torch::Tensor bias_view = bias.view({-1, 1, 1}); // [c, 1, 1]
-                
-                sum_bias = (patches_tensor * bias_view).sum({-3, -2, -1});
+                if (is_sparse) {
+                    // Sparse: patches shape [unstable_size, batch, c, h, w]
+                    // einsum('sb...chw,c->sb...') equivalent
+                    // Sum over c, h, w (last 3 dims) after multiplying by bias
+                    torch::Tensor bias_view = bias.view({1, 1, -1, 1, 1}); // [1, 1, c, 1, 1]
+                    sum_bias = (patches_tensor * bias_view).sum({-3, -2, -1}); // [unstable_size, batch]
+                } else {
+                    // Dense: patches shape [out_c, batch, out_h, out_w, c, h, w]
+                    // einsum('sb...chw,c->sb...') -> sum over c,h,w after broadcast multiply
+                    torch::Tensor bias_view = bias.view({1, 1, 1, 1, -1, 1, 1}); // [1, 1, 1, 1, c, 1, 1]
+                    sum_bias = (patches_tensor * bias_view).sum({-3, -2, -1}); // [out_c, batch, out_h, out_w]
+                }
             } else {
-                sum_bias = torch::zeros({1}, patches_tensor.options()); 
+                sum_bias = torch::zeros({1}, patches_tensor.options());
             }
-            
-            // flattened_patches = patches.reshape(-1, patches.size(-3), patches.size(-2), patches.size(-1))
+
+            // Flatten patches for conv_transpose2d
             int64_t C = patches_tensor.size(-3);
             int64_t H = patches_tensor.size(-2);
             int64_t W = patches_tensor.size(-1);
-            
+
             torch::Tensor flattened = patches_tensor.reshape({-1, C, H, W});
-            
-            // pieces = F.conv_transpose2d(flattened, insert_zeros(weight, inserted_zeros), stride=stride)
+
+            // Apply conv_transpose2d with insert_zeros for stride handling
             torch::Tensor weight_processed = insert_zeros(weight, last_patches->inserted_zeros);
-            
+
             std::vector<int64_t> stride_64(stride.begin(), stride.end());
             pieces = torch::nn::functional::conv_transpose2d(
                 flattened, weight_processed,
                 torch::nn::functional::ConvTranspose2dFuncOptions().stride(stride_64)
             );
-            
-            // Reshape pieces back
-            // pieces = pieces.view(*patches.shape[:-3], pieces.size(-3), pieces.size(-2), pieces.size(-1))
+
+            // Reshape pieces back to original patch dimensions
             std::vector<int64_t> new_shape;
-            for(int i=0; i<patches_tensor.dim()-3; ++i) new_shape.push_back(patches_tensor.size(i));
+            for(int i = 0; i < patches_tensor.dim() - 3; ++i) {
+                new_shape.push_back(patches_tensor.size(i));
+            }
             new_shape.push_back(pieces.size(-3));
             new_shape.push_back(pieces.size(-2));
             new_shape.push_back(pieces.size(-1));
-            
+
             pieces = pieces.view(new_shape);
-            
+
         } else if (last_patches->identity == 1) {
             // Identity patches
             // weight: [out_c, in_c, k_h, k_w]
-            
+
             if (last_patches->unstable_idx.has_value()) {
-                throw std::runtime_error("BoundedConvNode: Sparse identity patches not implemented");
+                // Sparse identity patches - only compute for unstable neurons
+                // This is a key optimization: we only propagate bounds for neurons that cross zero
+                const auto& unstable_idx = last_patches->unstable_idx.value();
+
+                // unstable_idx[0] contains the channel indices of unstable neurons
+                // For conv layers, we select weights for those output channels
+                // pieces shape: [unstable_size, batch, in_c, k_h, k_w]
+                pieces = weight.view({weight.size(0), 1, weight.size(1), weight.size(2), weight.size(3)});
+
+                // Select only the weights for unstable output channels
+                pieces = pieces.index_select(0, unstable_idx[0]);
+
+                // Expand batch dimension
+                int64_t batch_size = last_patches->output_shape[1];
+                pieces = pieces.expand({-1, batch_size, -1, -1, -1});
+
+                // Bias - also select only for unstable channels
+                if (has_bias && bias.defined()) {
+                    // Select bias for unstable channels and expand to (unstable_size, batch)
+                    sum_bias = bias.index_select(0, unstable_idx[0]).unsqueeze(-1);
+                    sum_bias = sum_bias.expand({-1, batch_size});
+                } else {
+                    sum_bias = torch::zeros({1}, weight.options());
+                }
             } else {
+                // Dense (non-sparse) identity patches
                 pieces = weight.view({weight.size(0), 1, 1, 1, weight.size(1), weight.size(2), weight.size(3)});
                 // Expand
                 std::vector<int64_t> expand_dims = {
-                    weight.size(0), 
+                    weight.size(0),
                     last_patches->output_shape[1], // batch
                     last_patches->output_shape[2], // out_h
                     last_patches->output_shape[3], // out_w
                     weight.size(1), weight.size(2), weight.size(3)
                 };
                 pieces = pieces.expand(expand_dims);
-                
+
                 // Bias
-                if (has_bias) {
+                if (has_bias && bias.defined()) {
                     sum_bias = bias.view({-1, 1, 1, 1}).expand({
                         weight.size(0), last_patches->output_shape[1], last_patches->output_shape[2], last_patches->output_shape[3]
                     });
@@ -840,15 +878,37 @@ BoundA BoundedConvNode::boundOneSide(const BoundA& last_A,
                                        new_padding_vec, new_stride_vec, new_output_padding_vec);
         
     
-        if (last_patches->inserted_zeros == 0 && !is_shape_used(new_output_padding_vec) && 
-            pieces.size(-1) > input_shape[3]) {
-            
-            // Patches too large, convert to matrix
-            // return patches_to_matrix(...)
-           
-            (void)0;
+        // Check if patches are too large and should be converted to matrix mode
+        if (last_patches->inserted_zeros == 0 && !is_shape_used(new_output_padding_vec) &&
+            pieces.size(-1) > static_cast<int64_t>(input_shape[3])) {
+
+            // Patches too large - convert to dense matrix for efficiency
+            // This avoids excessive memory usage from large patch representations
+            std::vector<int64_t> in_shape_64;
+            for (int s : input_shape) in_shape_64.push_back(static_cast<int64_t>(s));
+            std::vector<int64_t> out_shape_64;
+            for (int64_t s : last_patches->output_shape) out_shape_64.push_back(s);
+
+            torch::Tensor A_matrix = Patches::patches_to_matrix(
+                pieces, in_shape_64, new_stride_vec, new_padding_vec,
+                out_shape_64, last_patches->unstable_idx, 0
+            );
+
+            // Reshape sum_bias if needed for matrix mode
+            if (sum_bias.defined() && !last_patches->unstable_idx.has_value()) {
+                // For dense patches, sum_bias is [out_c, batch, out_h, out_w]
+                // Need to transpose to [batch, out_c*out_h*out_w] then transpose back
+                sum_bias = sum_bias.permute({1, 0, 2, 3}); // [batch, out_c, out_h, out_w]
+                sum_bias = sum_bias.reshape({sum_bias.size(0), -1}); // [batch, out_c*out_h*out_w]
+                sum_bias = sum_bias.transpose(0, 1); // [out_c*out_h*out_w, batch] - spec dim first
+            }
+
+            // A_matrix is in [batch, spec, c, h, w] format, need [spec, batch, c, h, w]
+            A_matrix = A_matrix.transpose(0, 1);
+
+            return BoundA(A_matrix);
         }
-        
+
         return BoundA(last_patches->create_similar(
             pieces,
             new_stride_vec,

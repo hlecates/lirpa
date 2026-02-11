@@ -56,6 +56,9 @@ public:
         // Additional alpha-based slopes (for optimization mode)
         torch::Tensor lb_lower_d, ub_lower_d;  // Lower bound slopes for lA/uA
         torch::Tensor lb_upper_d, ub_upper_d;  // Upper bound slopes for lA/uA
+        // Optional per-path alpha-based biases (for closer auto_LiRPA matching)
+        torch::Tensor lb_lower_b, ub_lower_b;  // Lower-bound bias for lA/uA paths
+        torch::Tensor lb_upper_b, ub_upper_b;  // Upper-bound bias for lA/uA paths
     };
     
     // Unified backward relaxation method (following auto_LiRPA approach)
@@ -76,6 +79,10 @@ public:
     // CROWN slope access for alpha initialization (following auto_LiRPA approach)
     torch::Tensor getCROWNSlope(bool isLowerBound) const override;
 
+    // Expose precomputed tangent defaults for alpha initialization.
+    std::pair<torch::Tensor, torch::Tensor> getDefaultTangentPoints(
+        const torch::Tensor& lower, const torch::Tensor& upper);
+
 private:
     std::shared_ptr<torch::nn::Sigmoid> _sigmoidModule;
     
@@ -91,7 +98,7 @@ private:
     bool _lookupTablesInitialized = false;
     
     // Helper methods for lookup table generation and retrieval
-    void precomputeRelaxation();
+    void precomputeRelaxation(double required_limit = -1.0);
     void precomputeDfuncValues();
     torch::Tensor retrieveFromPrecompute(const torch::Tensor& precomputed_d, 
                                          const torch::Tensor& input_bound, 

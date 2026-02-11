@@ -75,10 +75,6 @@ public:
         this->to(device);
     }
 
-    // =========================================================================
-    // Node-based bound storage (auto_LiRPA style: node.lower/node.upper pattern)
-    // =========================================================================
-
     // Bound accessors (matching auto_LiRPA's property pattern)
     const torch::Tensor& getLower() const { return _lower; }
     const torch::Tensor& getUpper() const { return _upper; }
@@ -110,10 +106,6 @@ public:
     bool isLowerBoundCurrent() const { return _isLowerBoundCurrent; }
     bool isUpperBoundCurrent() const { return _isUpperBoundCurrent; }
     bool hasBounds() const { return _isLowerBoundCurrent && _isUpperBoundCurrent; }
-
-    // =========================================================================
-    // Lazy bound computation flags (auto_LiRPA style)
-    // =========================================================================
 
     // Which inputs require bounds for this node (e.g., ReLU needs bounds on input 0)
     const Vector<unsigned>& getRequiresInputBounds() const { return _requiresInputBounds; }

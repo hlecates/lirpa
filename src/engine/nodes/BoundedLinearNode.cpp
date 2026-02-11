@@ -14,7 +14,6 @@ NLR::BoundedLinearNode::BoundedLinearNode(const torch::nn::Linear& linearModule,
     _input_size = 0;
     _output_size = 0;
 
-    // Lazy computation flags (auto_LiRPA style)
     // Linear layers don't require input bounds for relaxation
     // _requiresInputBounds is already empty by default (no inputs need bounds)
     // Linear needs CROWN for tight bounds (not IBP), so _ibpIntermediate = false (default)

@@ -18,6 +18,11 @@ BoundedSigmoidNode::BoundedSigmoidNode(const torch::nn::Sigmoid& sigmoidModule, 
     _output_size = 0;
     num_points_pre = static_cast<int>(x_limit / step_pre);
     _lookupTablesInitialized = false;
+
+    // Lazy computation flags (match other nonlinear activations).
+    // Sigmoid relaxation requires bounds on input 0 and can use IBP intermediates.
+    _requiresInputBounds.append(0);
+    _ibpIntermediate = true;
 }
 
 // Forward pass through the sigmoid layer
@@ -64,12 +69,19 @@ torch::Tensor BoundedSigmoidNode::dsigmoidFunc(const torch::Tensor& x) {
 }
 
 // Precompute relaxation lookup tables (matching Python precompute_relaxation)
-void BoundedSigmoidNode::precomputeRelaxation() {
-    if (_lookupTablesInitialized && d_lower.defined()) {
+void BoundedSigmoidNode::precomputeRelaxation(double required_limit) {
+    double configured_limit = LunaConfiguration::SIGMOID_CUTOFF_CONSTANT;
+    double target_limit = configured_limit;
+    if (required_limit > target_limit) {
+        // Expand precompute range for this model/run when observed bounds exceed config.
+        target_limit = required_limit;
+    }
+
+    if (_lookupTablesInitialized && d_lower.defined() && target_limit <= x_limit) {
         return;
     }
     
-    x_limit = LunaConfiguration::SIGMOID_CUTOFF_CONSTANT;
+    x_limit = target_limit;
     step_pre = 0.01;
     num_points_pre = static_cast<int>(x_limit / step_pre);
     int max_iter = 100;
@@ -197,8 +209,12 @@ torch::Tensor BoundedSigmoidNode::retrieveFromPrecompute(const torch::Tensor& pr
 // Generate valid lower/upper bound slopes using lookup tables
 std::pair<torch::Tensor, torch::Tensor> BoundedSigmoidNode::generateDLowerUpper(const torch::Tensor& lower, 
                                                                                const torch::Tensor& upper) {
-    if (!_lookupTablesInitialized || !d_lower.defined()) {
-        precomputeRelaxation();
+    double needed_limit = std::max(
+        std::fabs(static_cast<double>(lower.min().item<float>())),
+        std::fabs(static_cast<double>(upper.max().item<float>())));
+    needed_limit += 1.0; // small margin to reduce frequent table rebuilds
+    if (!_lookupTablesInitialized || !d_lower.defined() || needed_limit > x_limit) {
+        precomputeRelaxation(needed_limit);
     }
     
     // Ensure lookup tables are on the same device and dtype as input tensors
@@ -413,6 +429,268 @@ BoundedSigmoidNode::RelaxationResult BoundedSigmoidNode::_backwardRelaxation(
     // Store slopes for alpha initialization if needed
     init_lower_d = lw.detach().clone();
     init_upper_d = uw.detach().clone();
+
+    // Alpha-CROWN optimization for sigmoid (auto_LiRPA-style per-start/per-spec alpha):
+    // optimize tangent-point selection for cross-zero neurons while keeping soundness.
+    if (isAlphaOptimizationEnabled() && _alphaCrownAnalysis
+        && (_optimizationStage == "opt" || _optimizationStage == "reuse")
+        && _currentSpecDim > 0)
+    {
+        auto* crown = _alphaCrownAnalysis->getCROWNAnalysis();
+        std::string startKey = crown ? crown->currentStartKey() : std::string();
+        if (startKey.empty()) startKey = "default";
+
+        auto lb_flat = input_lower.flatten();
+        auto ub_flat = input_upper.flatten();
+        int outDim = (int)lb_flat.numel();
+        int specDim = _currentSpecDim;
+
+        Vector<unsigned> currentSpecIndices;
+        bool hasSpecLookup = false;
+        Vector<unsigned> cachedSpecIndices;
+        bool cachedSparseMode = false;
+        unsigned cachedNodeSize = 0;
+        if (crown) {
+            currentSpecIndices = crown->currentStartSpecIndices();
+            hasSpecLookup = crown->getAlphaStartCacheInfo(startKey, cachedSpecIndices, cachedSparseMode, cachedNodeSize);
+        }
+
+        auto alphaResult = _alphaCrownAnalysis->getAlphaForNodeAllSpecs(
+            getNodeIndex(), /*isLower=*/true,
+            startKey, specDim, outDim, input_lower, input_upper);
+
+        if (alphaResult.numUnstable > 0 && alphaResult.alpha.defined() && alphaResult.alpha.numel() > 0) {
+            // Use a view into stored alpha so in-place projection updates optimizer parameters
+            // (auto_LiRPA projects alpha.data before using it in relaxations).
+            auto alpha_unstable = alphaResult.alpha; // [spec or spec+1, numUnstable, slots]
+
+            // Precompute safe tangent anchors for this interval.
+            auto d_pair = generateDLowerUpper(input_lower, input_upper);
+            auto d_lower_pre_flat = d_pair.first.flatten();
+            auto d_upper_pre_flat = d_pair.second.flatten();
+
+            // auto_LiRPA-style in-place projection on alpha parameter data.
+            // Keep all tangent-point channels inside valid interval-dependent ranges
+            // before evaluating linear relaxations.
+            if (alpha_unstable.dim() == 3 && alpha_unstable.size(2) >= 8) {
+                torch::NoGradGuard no_grad;
+                int64_t specAlpha = alpha_unstable.size(0);
+                auto idx = alphaResult.unstableIndices;
+                auto lb_unstable = lb_flat.index_select(0, idx).unsqueeze(0).expand({specAlpha, alphaResult.numUnstable});
+                auto ub_unstable = ub_flat.index_select(0, idx).unsqueeze(0).expand({specAlpha, alphaResult.numUnstable});
+                auto d_lower_unstable = d_lower_pre_flat.index_select(0, idx).unsqueeze(0).expand({specAlpha, alphaResult.numUnstable});
+                auto d_upper_unstable = d_upper_pre_flat.index_select(0, idx).unsqueeze(0).expand({specAlpha, alphaResult.numUnstable});
+
+                auto project_slot = [&](int slot, const torch::Tensor& lo, const torch::Tensor& hi) {
+                    auto s = alpha_unstable.select(2, slot);
+                    auto p = torch::max(torch::min(s, hi), lo);
+                    alpha_unstable.index_put_({torch::indexing::Slice(), torch::indexing::Slice(), slot}, p);
+                };
+
+                // tp_pos / tp_neg in [lb, ub]
+                project_slot(0, lb_unstable, ub_unstable);
+                project_slot(1, lb_unstable, ub_unstable);
+                project_slot(2, lb_unstable, ub_unstable);
+                project_slot(3, lb_unstable, ub_unstable);
+                // cross-zero lower tangents in [lb, d_lower_pre]
+                project_slot(4, lb_unstable, d_lower_unstable);
+                project_slot(5, lb_unstable, d_lower_unstable);
+                // cross-zero upper tangents in [d_upper_pre, ub]
+                project_slot(6, d_upper_unstable, ub_unstable);
+                project_slot(7, d_upper_unstable, ub_unstable);
+            }
+
+            // Map sparse-spec alpha (with default slot) into current spec ordering.
+            if (alphaResult.hasSpecDefaultSlot && hasSpecLookup && cachedSparseMode && cachedNodeSize > 0) {
+                auto lookup = torch::zeros({(long long)cachedNodeSize},
+                                           torch::TensorOptions().dtype(torch::kLong).device(alpha_unstable.device()));
+                for (int i = 0; i < (int)cachedSpecIndices.size(); ++i) {
+                    unsigned idx = cachedSpecIndices[i];
+                    if (idx < cachedNodeSize) {
+                        lookup[idx] = i + 1; // 0 is default slot
+                    }
+                }
+
+                if (currentSpecIndices.size() > 0) {
+                    auto idxTensor = torch::empty({(long long)currentSpecIndices.size()},
+                                                  torch::TensorOptions().dtype(torch::kLong).device(alpha_unstable.device()));
+                    for (int i = 0; i < (int)currentSpecIndices.size(); ++i) {
+                        unsigned idx = currentSpecIndices[i];
+                        idxTensor[i] = (idx < cachedNodeSize)
+                            ? static_cast<int64_t>(lookup[idx].item<int64_t>())
+                            : static_cast<int64_t>(0);
+                    }
+                    alpha_unstable = alpha_unstable.index_select(0, idxTensor);
+                    specDim = (int)alpha_unstable.size(0);
+                }
+            }
+
+            // Build dense alpha [spec, outDim] from unstable-only alpha.
+            auto options = alpha_unstable.options();
+            specDim = (int)alpha_unstable.size(0);
+            auto indices = alphaResult.unstableIndices.unsqueeze(0).expand({specDim, alphaResult.numUnstable});
+            auto make_alpha_full = [&](const torch::Tensor& alpha_slice_2d) {
+                return torch::zeros({specDim, outDim}, options).scatter(1, indices, alpha_slice_2d);
+            };
+
+            torch::Tensor tp_pos_l, tp_pos_u;
+            torch::Tensor tp_neg_l, tp_neg_u;
+            torch::Tensor tp_both_lower_l, tp_both_lower_u;
+            torch::Tensor tp_both_upper_l, tp_both_upper_u;
+
+            if (alpha_unstable.dim() == 3 && alpha_unstable.size(2) >= 8) {
+                tp_pos_l = make_alpha_full(alpha_unstable.select(2, 0));
+                tp_pos_u = make_alpha_full(alpha_unstable.select(2, 1));
+                tp_neg_l = make_alpha_full(alpha_unstable.select(2, 2));
+                tp_neg_u = make_alpha_full(alpha_unstable.select(2, 3));
+                tp_both_lower_l = make_alpha_full(alpha_unstable.select(2, 4));
+                tp_both_lower_u = make_alpha_full(alpha_unstable.select(2, 5));
+                tp_both_upper_l = make_alpha_full(alpha_unstable.select(2, 6));
+                tp_both_upper_u = make_alpha_full(alpha_unstable.select(2, 7));
+            } else {
+                // Backward-compatible fallback: share one alpha across all branches.
+                torch::Tensor alpha_base = (alpha_unstable.dim() == 3) ? alpha_unstable.select(2, 0) : alpha_unstable;
+                torch::Tensor alpha_full = make_alpha_full(alpha_base);
+                tp_pos_l = alpha_full;
+                tp_pos_u = alpha_full;
+                tp_neg_l = alpha_full;
+                tp_neg_u = alpha_full;
+                tp_both_lower_l = alpha_full;
+                tp_both_lower_u = alpha_full;
+                tp_both_upper_l = alpha_full;
+                tp_both_upper_u = alpha_full;
+            }
+
+            // Recompute masks/direct-line conditions for cross-zero region.
+            torch::Tensor y_l = sigmoidFunc(input_lower);
+            torch::Tensor y_u = sigmoidFunc(input_upper);
+            torch::Tensor k_direct = (y_u - y_l) / (input_upper - input_lower).clamp_min(1e-8);
+            torch::Tensor mask_almost_the_same = (input_upper - input_lower).abs() < 1e-4;
+            k_direct = torch::where(mask_almost_the_same, dsigmoidFunc(input_lower), k_direct);
+
+            auto mask_pos_flat = (input_lower >= 0).flatten();
+            auto mask_neg_flat = (input_upper <= 0).flatten();
+            auto mask_both_flat = torch::logical_not(torch::logical_or(mask_pos_flat, mask_neg_flat));
+            auto k_lower_flat = dsigmoidFunc(input_lower).flatten();
+            auto k_upper_flat = dsigmoidFunc(input_upper).flatten();
+            auto k_direct_flat = k_direct.flatten();
+            auto mask_direct_lower_flat = torch::logical_and(mask_both_flat, k_direct_flat < k_lower_flat);
+            auto mask_direct_upper_flat = torch::logical_and(mask_both_flat, k_direct_flat < k_upper_flat);
+
+            // Optimize where default CROWN uses tangent (not direct secant) in cross-zero region.
+            auto opt_mask_lower_flat = torch::logical_and(mask_both_flat, torch::logical_not(mask_direct_lower_flat));
+            auto opt_mask_upper_flat = torch::logical_and(mask_both_flat, torch::logical_not(mask_direct_upper_flat));
+
+            // Parameterize tangent points with alpha in [0,1]:
+            // tp_lower in [lower, d_lower_pre], tp_upper in [d_upper_pre, upper].
+            auto lb_expanded = lb_flat.unsqueeze(0).expand({specDim, outDim});
+            auto ub_expanded = ub_flat.unsqueeze(0).expand({specDim, outDim});
+            auto d_lower_expanded = d_lower_pre_flat.unsqueeze(0).expand({specDim, outDim});
+            auto d_upper_expanded = d_upper_pre_flat.unsqueeze(0).expand({specDim, outDim});
+
+            // auto_LiRPA-style tangent-point projection (functional, no in-place).
+            auto clamp_interval = [&](const torch::Tensor& t) {
+                return torch::max(torch::min(t, ub_expanded), lb_expanded);
+            };
+            tp_pos_l = clamp_interval(tp_pos_l);
+            tp_pos_u = clamp_interval(tp_pos_u);
+            tp_neg_l = clamp_interval(tp_neg_l);
+            tp_neg_u = clamp_interval(tp_neg_u);
+            // Keep cross-zero tangent points inside valid branch-specific intervals:
+            // - lower branch tangent point in [lb, d_lower_pre]
+            // - upper branch tangent point in [d_upper_pre, ub]
+            tp_both_lower_l = torch::max(torch::min(tp_both_lower_l, d_lower_expanded), lb_expanded);
+            tp_both_lower_u = torch::max(torch::min(tp_both_lower_u, d_lower_expanded), lb_expanded);
+            tp_both_upper_l = torch::min(torch::max(tp_both_upper_l, d_upper_expanded), ub_expanded);
+            tp_both_upper_u = torch::min(torch::max(tp_both_upper_u, d_upper_expanded), ub_expanded);
+
+            auto k_tp = [&](const torch::Tensor& tp) { return dsigmoidFunc(tp); };
+            auto b_tp = [&](const torch::Tensor& tp) {
+                auto k = dsigmoidFunc(tp);
+                auto y = sigmoidFunc(tp);
+                return y - k * tp;
+            };
+
+            auto k_both_lower_l = k_tp(tp_both_lower_l);
+            auto k_both_lower_u = k_tp(tp_both_lower_u);
+            auto k_both_upper_l = k_tp(tp_both_upper_l);
+            auto k_both_upper_u = k_tp(tp_both_upper_u);
+            auto b_both_lower_l = b_tp(tp_both_lower_l);
+            auto b_both_lower_u = b_tp(tp_both_lower_u);
+            auto b_both_upper_l = b_tp(tp_both_upper_l);
+            auto b_both_upper_u = b_tp(tp_both_upper_u);
+
+            auto k_neg_l = k_tp(tp_neg_l);
+            auto k_neg_u = k_tp(tp_neg_u);
+            auto k_pos_l = k_tp(tp_pos_l);
+            auto k_pos_u = k_tp(tp_pos_u);
+            auto b_neg_l = b_tp(tp_neg_l);
+            auto b_neg_u = b_tp(tp_neg_u);
+            auto b_pos_l = b_tp(tp_pos_l);
+            auto b_pos_u = b_tp(tp_pos_u);
+
+            // Start from baseline CROWN coefficients and overwrite optimized subsets.
+            torch::Tensor d_lower_spec = result.d_lower.flatten().unsqueeze(0).expand({specDim, outDim}).clone();
+            torch::Tensor d_upper_spec = result.d_upper.flatten().unsqueeze(0).expand({specDim, outDim}).clone();
+            torch::Tensor b_lower_spec = result.bias_lower.flatten().unsqueeze(0).expand({specDim, outDim}).clone();
+            torch::Tensor b_upper_spec = result.bias_upper.flatten().unsqueeze(0).expand({specDim, outDim}).clone();
+
+            auto opt_mask_lower = opt_mask_lower_flat.unsqueeze(0).expand({specDim, outDim});
+            auto opt_mask_upper = opt_mask_upper_flat.unsqueeze(0).expand({specDim, outDim});
+            auto mask_neg = mask_neg_flat.unsqueeze(0).expand({specDim, outDim});
+            auto mask_pos = mask_pos_flat.unsqueeze(0).expand({specDim, outDim});
+
+            // Lower-path coefficients (used by lA sign-split):
+            // - lower branch: mask_neg uses tp_neg_l, cross-zero tangent uses tp_both_lower_l
+            // - upper branch: mask_pos uses tp_pos_l, cross-zero tangent uses tp_both_upper_l
+            auto d_lower_l_path = d_lower_spec.clone();
+            auto b_lower_l_path = b_lower_spec.clone();
+            auto d_upper_l_path = d_upper_spec.clone();
+            auto b_upper_l_path = b_upper_spec.clone();
+
+            d_lower_l_path = torch::where(mask_neg, k_neg_l, d_lower_l_path);
+            b_lower_l_path = torch::where(mask_neg, b_neg_l, b_lower_l_path);
+            d_lower_l_path = torch::where(opt_mask_lower, k_both_lower_l, d_lower_l_path);
+            b_lower_l_path = torch::where(opt_mask_lower, b_both_lower_l, b_lower_l_path);
+
+            d_upper_l_path = torch::where(mask_pos, k_pos_l, d_upper_l_path);
+            b_upper_l_path = torch::where(mask_pos, b_pos_l, b_upper_l_path);
+            d_upper_l_path = torch::where(opt_mask_upper, k_both_upper_l, d_upper_l_path);
+            b_upper_l_path = torch::where(opt_mask_upper, b_both_upper_l, b_upper_l_path);
+
+            // Upper-path coefficients (used by uA sign-split):
+            // same structure but with *_u tangent-point channels.
+            auto d_lower_u_path = d_lower_spec.clone();
+            auto b_lower_u_path = b_lower_spec.clone();
+            auto d_upper_u_path = d_upper_spec.clone();
+            auto b_upper_u_path = b_upper_spec.clone();
+
+            d_lower_u_path = torch::where(mask_neg, k_neg_u, d_lower_u_path);
+            b_lower_u_path = torch::where(mask_neg, b_neg_u, b_lower_u_path);
+            d_lower_u_path = torch::where(opt_mask_lower, k_both_lower_u, d_lower_u_path);
+            b_lower_u_path = torch::where(opt_mask_lower, b_both_lower_u, b_lower_u_path);
+
+            d_upper_u_path = torch::where(mask_pos, k_pos_u, d_upper_u_path);
+            b_upper_u_path = torch::where(mask_pos, b_pos_u, b_upper_u_path);
+            d_upper_u_path = torch::where(opt_mask_upper, k_both_upper_u, d_upper_u_path);
+            b_upper_u_path = torch::where(opt_mask_upper, b_both_upper_u, b_upper_u_path);
+
+            // Per-spec coefficients consumed by sign-split boundBackward.
+            result.lb_lower_d = d_lower_l_path; // lower path, A >= 0
+            result.lb_upper_d = d_upper_l_path; // lower path, A < 0
+            result.ub_upper_d = d_upper_u_path; // upper path, A >= 0
+            result.ub_lower_d = d_lower_u_path; // upper path, A < 0
+
+            result.lb_lower_b = b_lower_l_path;
+            result.lb_upper_b = b_upper_l_path;
+            result.ub_lower_b = b_lower_u_path;
+            result.ub_upper_b = b_upper_u_path;
+
+            // Keep generic fields populated for compatibility/logging.
+            result.bias_lower = b_lower_l_path;
+            result.bias_upper = b_upper_u_path;
+        }
+    }
     
     return result;
 }
@@ -484,6 +762,16 @@ void BoundedSigmoidNode::boundBackward(
     auto expand_like = [](torch::Tensor v, const torch::Tensor& A) {
         if (!v.defined() || !A.defined()) return v;
 
+        // Per-spec slopes: v [spec, out], A [spec, batch, out] -> [spec, 1, out].
+        if (v.dim() == 2 && A.dim() == 3 && v.size(0) == A.size(0)) {
+            v = v.unsqueeze(1);
+            try {
+                return v.expand_as(A);
+            } catch (...) {
+                return v;
+            }
+        }
+
         // Handle the common "flat-to-conv" mismatch by reshaping v when its numel matches
         if (v.numel() > 0 && A.dim() >= 3) {
             int64_t payload_numel = 1;
@@ -521,7 +809,8 @@ void BoundedSigmoidNode::boundBackward(
             return dims.empty() ? term : term.sum(dims);
         }
         if (A.dim() == 2) {
-            return (term.dim() >= 2) ? term.sum({1}) : term;
+            auto reduced = (term.dim() >= 2) ? term.sum({1}) : term;
+            return reduced.dim() == 1 ? reduced.unsqueeze(1) : reduced;
         }
         return term;
     };
@@ -530,30 +819,51 @@ void BoundedSigmoidNode::boundBackward(
 
     // ----- LOWER path -----
     if (last_lA.defined()) {
-        auto d_l = relaxation_result.d_lower;
-        auto b_l = relaxation_result.bias_lower;
+        auto aL_l = relaxation_result.lb_lower_d.defined() ? relaxation_result.lb_lower_d : relaxation_result.d_lower;
+        auto aU_l = relaxation_result.lb_upper_d.defined() ? relaxation_result.lb_upper_d : relaxation_result.d_upper;
+        auto bL_l = relaxation_result.lb_lower_b.defined()
+            ? relaxation_result.lb_lower_b
+            : (relaxation_result.bias_lower.defined() ? relaxation_result.bias_lower : torch::zeros_like(input_lower));
+        auto bU_l = relaxation_result.lb_upper_b.defined()
+            ? relaxation_result.lb_upper_b
+            : (relaxation_result.bias_upper.defined() ? relaxation_result.bias_upper : torch::zeros_like(input_lower));
 
         if (last_lA.isTensor()) {
             torch::Tensor lA = last_lA.asTensor();
-            auto A_l = lA * expand_like(d_l, lA);
+            auto Apos = torch::clamp_min(lA, 0);
+            auto Aneg = torch::clamp_max(lA, 0);
+            auto aL_l_exp = expand_like(aL_l, lA);
+            auto aU_l_exp = expand_like(aU_l, lA);
+            auto bL_l_exp = expand_like(bL_l, lA);
+            auto bU_l_exp = expand_like(bU_l, lA);
+            auto A_l = Apos * aL_l_exp + Aneg * aU_l_exp;
             new_lA = BoundA(A_l);
-            auto add_lbias = reduce_bias_like_A(lA * expand_like(b_l, lA), lA);
+            auto b_l = Apos * bL_l_exp + Aneg * bU_l_exp;
+            auto add_lbias = reduce_bias_like_A(b_l, lA);
             lbias = lbias.defined() ? (lbias + add_lbias) : add_lbias;
         } else {
             // Patches mode
             auto patches = last_lA.asPatches();
-            torch::Tensor d_l_unfolded = maybe_unfold_patches(d_l, last_lA);
+            torch::Tensor aL_l_unfolded = maybe_unfold_patches(aL_l, last_lA);
+            torch::Tensor aU_l_unfolded = maybe_unfold_patches(aU_l, last_lA);
             torch::Tensor P = patches->patches;
-            torch::Tensor P_new = P * d_l_unfolded;
+            torch::Tensor Ppos = torch::clamp_min(P, 0);
+            torch::Tensor Pneg = torch::clamp_max(P, 0);
+            torch::Tensor P_new = Ppos * aL_l_unfolded + Pneg * aU_l_unfolded;
             new_lA = BoundA(patches->create_similar(P_new));
             
             // Bias handling for patches
-            if (b_l.dim() == 3) b_l = b_l.unsqueeze(0);
-            torch::Tensor b_l_unfolded = inplace_unfold(b_l, 
+            if (bL_l.dim() == 3) bL_l = bL_l.unsqueeze(0);
+            if (bU_l.dim() == 3) bU_l = bU_l.unsqueeze(0);
+            torch::Tensor bL_l_unfolded = inplace_unfold(bL_l, 
                 {patches->patches.size(-2), patches->patches.size(-1)}, 
                 patches->stride, patches->padding, patches->inserted_zeros, patches->output_padding);
-            torch::Tensor b_l_ready = b_l_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
-            torch::Tensor total_bias = (P * b_l_ready).sum({-3, -2, -1});
+            torch::Tensor bL_l_ready = bL_l_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
+            torch::Tensor bU_l_unfolded = inplace_unfold(bU_l, 
+                {patches->patches.size(-2), patches->patches.size(-1)}, 
+                patches->stride, patches->padding, patches->inserted_zeros, patches->output_padding);
+            torch::Tensor bU_l_ready = bU_l_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
+            torch::Tensor total_bias = (Ppos * bL_l_ready + Pneg * bU_l_ready).sum({-3, -2, -1});
             total_bias = total_bias.permute({1, 0, 2, 3});
             lbias = lbias.defined() ? (lbias + total_bias) : total_bias;
         }
@@ -561,30 +871,51 @@ void BoundedSigmoidNode::boundBackward(
 
     // ----- UPPER path -----
     if (last_uA.defined()) {
-        auto d_u = relaxation_result.d_upper;
-        auto b_u = relaxation_result.bias_upper;
+        auto aU_u = relaxation_result.ub_upper_d.defined() ? relaxation_result.ub_upper_d : relaxation_result.d_upper;
+        auto aL_u = relaxation_result.ub_lower_d.defined() ? relaxation_result.ub_lower_d : relaxation_result.d_lower;
+        auto bU_u = relaxation_result.ub_upper_b.defined()
+            ? relaxation_result.ub_upper_b
+            : (relaxation_result.bias_upper.defined() ? relaxation_result.bias_upper : torch::zeros_like(input_lower));
+        auto bL_u = relaxation_result.ub_lower_b.defined()
+            ? relaxation_result.ub_lower_b
+            : (relaxation_result.bias_lower.defined() ? relaxation_result.bias_lower : torch::zeros_like(input_lower));
 
         if (last_uA.isTensor()) {
             torch::Tensor uA = last_uA.asTensor();
-            auto A_u = uA * expand_like(d_u, uA);
+            auto Apos = torch::clamp_min(uA, 0);
+            auto Aneg = torch::clamp_max(uA, 0);
+            auto aU_u_exp = expand_like(aU_u, uA);
+            auto aL_u_exp = expand_like(aL_u, uA);
+            auto bU_u_exp = expand_like(bU_u, uA);
+            auto bL_u_exp = expand_like(bL_u, uA);
+            auto A_u = Apos * aU_u_exp + Aneg * aL_u_exp;
             new_uA = BoundA(A_u);
-            auto add_ubias = reduce_bias_like_A(uA * expand_like(b_u, uA), uA);
+            auto b_u = Apos * bU_u_exp + Aneg * bL_u_exp;
+            auto add_ubias = reduce_bias_like_A(b_u, uA);
             ubias = ubias.defined() ? (ubias + add_ubias) : add_ubias;
         } else {
             // Patches mode
             auto patches = last_uA.asPatches();
-            torch::Tensor d_u_unfolded = maybe_unfold_patches(d_u, last_uA);
+            torch::Tensor aU_u_unfolded = maybe_unfold_patches(aU_u, last_uA);
+            torch::Tensor aL_u_unfolded = maybe_unfold_patches(aL_u, last_uA);
             torch::Tensor P = patches->patches;
-            torch::Tensor P_new = P * d_u_unfolded;
+            torch::Tensor Ppos = torch::clamp_min(P, 0);
+            torch::Tensor Pneg = torch::clamp_max(P, 0);
+            torch::Tensor P_new = Ppos * aU_u_unfolded + Pneg * aL_u_unfolded;
             new_uA = BoundA(patches->create_similar(P_new));
             
             // Bias handling for patches
-            if (b_u.dim() == 3) b_u = b_u.unsqueeze(0);
-            torch::Tensor b_u_unfolded = inplace_unfold(b_u, 
+            if (bU_u.dim() == 3) bU_u = bU_u.unsqueeze(0);
+            if (bL_u.dim() == 3) bL_u = bL_u.unsqueeze(0);
+            torch::Tensor bU_u_unfolded = inplace_unfold(bU_u, 
                 {patches->patches.size(-2), patches->patches.size(-1)}, 
                 patches->stride, patches->padding, patches->inserted_zeros, patches->output_padding);
-            torch::Tensor b_u_ready = b_u_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
-            torch::Tensor total_bias = (P * b_u_ready).sum({-3, -2, -1});
+            torch::Tensor bU_u_ready = bU_u_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
+            torch::Tensor bL_u_unfolded = inplace_unfold(bL_u, 
+                {patches->patches.size(-2), patches->patches.size(-1)}, 
+                patches->stride, patches->padding, patches->inserted_zeros, patches->output_padding);
+            torch::Tensor bL_u_ready = bL_u_unfolded.permute({0, 1, 2, 3, 4, 5}).unsqueeze(0);
+            torch::Tensor total_bias = (Ppos * bU_u_ready + Pneg * bL_u_ready).sum({-3, -2, -1});
             total_bias = total_bias.permute({1, 0, 2, 3});
             ubias = ubias.defined() ? (ubias + total_bias) : total_bias;
         }
@@ -633,6 +964,12 @@ torch::Tensor BoundedSigmoidNode::getCROWNSlope(bool isLowerBound) const
         }
         return init_upper_d;
     }
+}
+
+std::pair<torch::Tensor, torch::Tensor> BoundedSigmoidNode::getDefaultTangentPoints(
+    const torch::Tensor& lower, const torch::Tensor& upper)
+{
+    return generateDLowerUpper(lower, upper);
 }
 
 } // namespace NLR

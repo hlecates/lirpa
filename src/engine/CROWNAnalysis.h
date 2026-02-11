@@ -83,11 +83,7 @@ public:
     bool checkIBPFirstLinear(unsigned nodeIndex);
     bool isFirstLinearLayer(unsigned nodeIndex);
     // Configuration gating: use LunaConfiguration::ENABLE_FIRST_LINEAR_IBP directly
-
-    // =========================================================================
-    // Lazy intermediate bound computation (auto_LiRPA style)
-    // =========================================================================
-
+    
     // Check if IBP can be used for intermediate bounds (walks backward checking ibpIntermediate flags)
     bool checkIBPIntermediate(unsigned nodeIndex);
 

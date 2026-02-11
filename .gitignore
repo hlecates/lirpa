@@ -243,7 +243,7 @@ run_acas_alpha_crown.py
 run_cora_alpha_crown.py
 run_safenlp_alpha_crown.py
 
-auto_LiRPA/
+#auto_LiRPA/
 
 .claude/
 .cursor/

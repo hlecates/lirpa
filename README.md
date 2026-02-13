@@ -1,10 +1,8 @@
-# Luna: High-Performance Neural Network Verification Engine
+# Luna: Bound Propagator for Neural Network Analysis
 
 ## Introduction
 
-Luna is a high-performance neural network verification engine written in C++17
-with Python bindings. It implements state-of-the-art linear relaxation based
-perturbation analysis (LiRPA) algorithms, including
+Luna is a bound propagation egine for neural network verification engine written in C++17with Python bindings. It implements state-of-the-art linear relaxation basedperturbation analysis (LiRPA) algorithms, including
 [CROWN](https://arxiv.org/pdf/1811.00866.pdf) and
 [Alpha-CROWN](https://arxiv.org/pdf/2011.13824.pdf), to compute guaranteed
 output bounds for neural networks under input perturbations.
